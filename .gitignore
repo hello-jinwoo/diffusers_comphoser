@@ -180,8 +180,10 @@ tags
 # wandb
 wandb
 
-# AI agent generated symlinks
-/AGENTS.md
-/CLAUDE.md
-/.agents/skills
-/.claude/skills
+# AI agent and Codex artifacts
+.ai/
+.codex/
+.agents/
+.claude/
+**/AGENTS.md
+**/CLAUDE.md
