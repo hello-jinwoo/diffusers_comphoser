@@ -65,6 +65,37 @@ This writes a local `imagefolder` dataset under `./sample_data/flux2_klein_lora_
 - conditioning-image column: `conditioning_image`
 - prompt column: `instruction`
 
+Single-GPU end-to-end command with final inference:
+
+```bash
+accelerate launch --num_processes=1 examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py \
+  --pretrained_model_name_or_path=black-forest-labs/FLUX.2-klein-4B \
+  --dataset_name=./sample_data/flux2_klein_lora_smoke \
+  --image_column=image \
+  --cond_image_column=conditioning_image \
+  --caption_column=instruction \
+  --output_dir=./runs/flux2-klein-img2img-lora-end2end-single-gpu \
+  --cache_latents \
+  --gradient_checkpointing \
+  --mixed_precision=bf16 \
+  --resolution=512 \
+  --train_batch_size=1 \
+  --guidance_scale=1 \
+  --gradient_accumulation_steps=1 \
+  --optimizer=AdamW \
+  --learning_rate=1e-4 \
+  --lr_scheduler=constant \
+  --lr_warmup_steps=0 \
+  --max_train_steps=10 \
+  --rank=8 \
+  --seed=0 \
+  --dataloader_num_workers=0 \
+  --validation_prompt="restore the butterfly photo from the blurred low-resolution reference while preserving natural wing patterns and color" \
+  --validation_image=./sample_data/flux2_klein_lora_smoke/train/conditioning/000.png \
+  --num_validation_images=1 \
+  --validation_epochs=10
+```
+
 Multi-GPU end-to-end command with final inference:
 
 ```bash
