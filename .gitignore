@@ -187,6 +187,8 @@ wandb
 .codex/
 .agents/
 .claude/
+# Explicit task artifact cache under Codex
+.codex/tasks/*
 /docs/
 /.codex/
 /.agents/
