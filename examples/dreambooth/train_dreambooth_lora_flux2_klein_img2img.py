@@ -250,6 +250,39 @@ def module_filter_fn(mod: torch.nn.Module, fqn: str):
     return True
 
 
+def resolve_dataset_image_entry(entry: Any, dataset_name: str, split: str = "train") -> Image.Image:
+    if isinstance(entry, Image.Image):
+        return entry
+
+    image_path = None
+    if isinstance(entry, str):
+        image_path = entry
+    elif isinstance(entry, dict) and isinstance(entry.get("path"), str):
+        image_path = entry["path"]
+
+    if image_path is None:
+        raise TypeError(
+            "Expected the dataset image entry to be a PIL image, a string path, or a {'path': ...} mapping, "
+            f"but received {type(entry).__name__}."
+        )
+
+    if image_path.startswith(("http://", "https://")):
+        return load_image(image_path)
+
+    candidate_paths = [Path(image_path).expanduser()]
+    dataset_root = Path(dataset_name).expanduser()
+    candidate_paths.append(dataset_root / image_path)
+    candidate_paths.append(dataset_root / split / image_path)
+
+    for candidate_path in candidate_paths:
+        if candidate_path.is_file():
+            return Image.open(candidate_path)
+
+    raise FileNotFoundError(
+        f"Could not resolve dataset image path '{image_path}' from dataset root '{dataset_root}'."
+    )
+
+
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
@@ -785,7 +818,10 @@ class DreamBoothDataset(Dataset):
             cond_images = None
             cond_image_column = args.cond_image_column
             if cond_image_column is not None:
-                cond_images = [dataset["train"][i][cond_image_column] for i in range(len(dataset["train"]))]
+                cond_images = [
+                    resolve_dataset_image_entry(dataset["train"][i][cond_image_column], args.dataset_name)
+                    for i in range(len(dataset["train"]))
+                ]
                 assert len(instance_images) == len(cond_images)
 
             if args.caption_column is None:
@@ -1770,8 +1806,15 @@ def main(args):
             if global_step >= args.max_train_steps:
                 break
 
-        if accelerator.is_main_process:
-            if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
+        should_run_epoch_validation = (
+            args.validation_prompt is not None
+            and args.validation_epochs is not None
+            and args.validation_epochs > 0
+            and (epoch + 1) % args.validation_epochs == 0
+        )
+        if should_run_epoch_validation:
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
                 # create pipeline
                 pipeline = Flux2KleinPipeline.from_pretrained(
                     args.pretrained_model_name_or_path,
@@ -1793,6 +1836,7 @@ def main(args):
 
                 del pipeline
                 free_memory()
+            accelerator.wait_for_everyone()
 
     # Save the lora layers
     accelerator.wait_for_everyone()
@@ -1886,6 +1930,7 @@ def main(args):
                 ignore_patterns=["step_*", "epoch_*"],
             )
 
+    accelerator.wait_for_everyone()
     accelerator.end_training()
 
 

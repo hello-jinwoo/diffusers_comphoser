@@ -148,6 +148,7 @@ runs
 
 # data
 /data
+/sample_data
 serialization_dir
 
 # emacs
