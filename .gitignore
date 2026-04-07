@@ -187,5 +187,8 @@ wandb
 .codex/
 .agents/
 .claude/
+/docs/
+/.codex/
+/.agents/
 **/AGENTS.md
 **/CLAUDE.md
