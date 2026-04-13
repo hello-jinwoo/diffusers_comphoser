@@ -32,7 +32,6 @@
 # ]
 # ///
 
-import argparse
 import copy
 import itertools
 import json
@@ -41,9 +40,18 @@ import math
 import os
 import random
 import shutil
+import sys
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
+
+# Prefer this checkout's src/ tree over other editable comphoser installs.
+_REPO_SRC = Path(__file__).resolve().parents[2] / "src"
+if _REPO_SRC.is_dir():
+    _repo_src_str = str(_REPO_SRC)
+    if _repo_src_str in sys.path:
+        sys.path.remove(_repo_src_str)
+    sys.path.insert(0, _repo_src_str)
 
 import numpy as np
 import torch
@@ -64,6 +72,25 @@ from tqdm.auto import tqdm
 from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 
 import diffusers
+from comphoser import (
+    PreparedPilotDataset,
+    collate_prepared_pilot_examples,
+    has_pilot_qformer_checkpoint,
+    load_pilot_qformer_checkpoint,
+    prepare_pilot_transformer_conditioning,
+    resolve_pilot_batch_task_strengths,
+    save_pilot_qformer_checkpoint,
+)
+from comphoser.train_args import parse_args
+from comphoser.train_runtime import (
+    build_detached_validation_pipeline,
+    build_detached_validation_qformer,
+    build_pilot_checkpoint_metadata,
+    build_pilot_qformer,
+    resolve_and_log_pilot_training,
+    run_comphoser_validation,
+    run_final_comphoser_export,
+)
 from diffusers import (
     AutoencoderKLFlux2,
     BitsAndBytesConfig,
@@ -196,9 +223,10 @@ def log_validation(
     is_final_validation=False,
 ):
     args.num_validation_images = args.num_validation_images if args.num_validation_images else 1
+    prompt_label = pipeline_args.get("prompt_label", args.validation_prompt)
     logger.info(
         f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-        f" {args.validation_prompt}."
+        f" {prompt_label}."
     )
     pipeline = pipeline.to(dtype=torch_dtype)
     pipeline.enable_model_cpu_offload()
@@ -228,7 +256,7 @@ def log_validation(
             tracker.log(
                 {
                     phase_name: [
-                        wandb.Image(image, caption=f"{i}: {args.validation_prompt}") for i, image in enumerate(images)
+                        wandb.Image(image, caption=f"{i}: {prompt_label}") for i, image in enumerate(images)
                     ]
                 }
             )
@@ -237,7 +265,6 @@ def log_validation(
     free_memory()
 
     return images
-
 
 def module_filter_fn(mod: torch.nn.Module, fqn: str):
     # don't convert the output module
@@ -281,479 +308,6 @@ def resolve_dataset_image_entry(entry: Any, dataset_name: str, split: str = "tra
     raise FileNotFoundError(
         f"Could not resolve dataset image path '{image_path}' from dataset root '{dataset_root}'."
     )
-
-
-def parse_args(input_args=None):
-    parser = argparse.ArgumentParser(description="Simple example of a training script.")
-    parser.add_argument(
-        "--pretrained_model_name_or_path",
-        type=str,
-        default=None,
-        required=True,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
-    )
-    parser.add_argument(
-        "--revision",
-        type=str,
-        default=None,
-        required=False,
-        help="Revision of pretrained model identifier from huggingface.co/models.",
-    )
-    parser.add_argument(
-        "--bnb_quantization_config_path",
-        type=str,
-        default=None,
-        help="Quantization config in a JSON file that will be used to define the bitsandbytes quant config of the DiT.",
-    )
-    parser.add_argument(
-        "--do_fp8_training",
-        action="store_true",
-        help="if we are doing FP8 training.",
-    )
-    parser.add_argument(
-        "--variant",
-        type=str,
-        default=None,
-        help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
-    )
-    parser.add_argument(
-        "--dataset_name",
-        type=str,
-        default=None,
-        help=(
-            "The name of the Dataset (from the HuggingFace hub) containing the training data of instance images (could be your own, possibly private,"
-            " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
-            " or to a folder containing files that 🤗 Datasets can understand."
-        ),
-    )
-    parser.add_argument(
-        "--dataset_config_name",
-        type=str,
-        default=None,
-        help="The config of the Dataset, leave as None if there's only one config.",
-    )
-    parser.add_argument(
-        "--instance_data_dir",
-        type=str,
-        default=None,
-        help=("A folder containing the training data. "),
-    )
-
-    parser.add_argument(
-        "--cache_dir",
-        type=str,
-        default=None,
-        help="The directory where the downloaded models and datasets will be stored.",
-    )
-
-    parser.add_argument(
-        "--image_column",
-        type=str,
-        default="image",
-        help="The column of the dataset containing the target image. By "
-        "default, the standard Image Dataset maps out 'file_name' "
-        "to 'image'.",
-    )
-    parser.add_argument(
-        "--cond_image_column",
-        type=str,
-        default=None,
-        help="Column in the dataset containing the condition image. Must be specified when performing I2I fine-tuning",
-    )
-    parser.add_argument(
-        "--caption_column",
-        type=str,
-        default=None,
-        help="The column of the dataset containing the instance prompt for each image",
-    )
-
-    parser.add_argument("--repeats", type=int, default=1, help="How many times to repeat the training data.")
-
-    parser.add_argument(
-        "--class_data_dir",
-        type=str,
-        default=None,
-        required=False,
-        help="A folder containing the training data of class images.",
-    )
-    parser.add_argument(
-        "--instance_prompt",
-        type=str,
-        default=None,
-        required=False,
-        help="The prompt with identifier specifying the instance, e.g. 'photo of a TOK dog', 'in the style of TOK'",
-    )
-    parser.add_argument(
-        "--max_sequence_length",
-        type=int,
-        default=512,
-        help="Maximum sequence length to use with with the T5 text encoder",
-    )
-    parser.add_argument(
-        "--validation_prompt",
-        type=str,
-        default=None,
-        help="A prompt that is used during validation to verify that the model is learning.",
-    )
-    parser.add_argument(
-        "--validation_image",
-        type=str,
-        default=None,
-        help="path to an image that is used during validation as the condition image to verify that the model is learning.",
-    )
-    parser.add_argument(
-        "--skip_final_inference",
-        default=False,
-        action="store_true",
-        help="Whether to skip the final inference step with loaded lora weights upon training completion. This will run intermediate validation inference if `validation_prompt` is provided. Specify to reduce memory.",
-    )
-    parser.add_argument(
-        "--final_validation_prompt",
-        type=str,
-        default=None,
-        help="A prompt that is used during a final validation to verify that the model is learning. Ignored if `--validation_prompt` is provided.",
-    )
-    parser.add_argument(
-        "--num_validation_images",
-        type=int,
-        default=4,
-        help="Number of images that should be generated during validation with `validation_prompt`.",
-    )
-    parser.add_argument(
-        "--validation_epochs",
-        type=int,
-        default=50,
-        help=(
-            "Run dreambooth validation every X epochs. Dreambooth validation consists of running the prompt"
-            " `args.validation_prompt` multiple times: `args.num_validation_images`."
-        ),
-    )
-    parser.add_argument(
-        "--rank",
-        type=int,
-        default=4,
-        help=("The dimension of the LoRA update matrices."),
-    )
-    parser.add_argument(
-        "--lora_alpha",
-        type=int,
-        default=4,
-        help="LoRA alpha to be used for additional scaling.",
-    )
-    parser.add_argument("--lora_dropout", type=float, default=0.0, help="Dropout probability for LoRA layers")
-
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="flux-dreambooth-lora",
-        help="The output directory where the model predictions and checkpoints will be written.",
-    )
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
-    parser.add_argument(
-        "--resolution",
-        type=int,
-        default=512,
-        help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
-            " resolution"
-        ),
-    )
-    parser.add_argument(
-        "--aspect_ratio_buckets",
-        type=str,
-        default=None,
-        help=(
-            "Aspect ratio buckets to use for training. Define as a string of 'h1,w1;h2,w2;...'. "
-            "e.g. '1024,1024;768,1360;1360,768;880,1168;1168,880;1248,832;832,1248'"
-            "Images will be resized and cropped to fit the nearest bucket. If provided, --resolution is ignored."
-        ),
-    )
-    parser.add_argument(
-        "--center_crop",
-        default=False,
-        action="store_true",
-        help=(
-            "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
-            " cropped. The images will be resized to the resolution first before cropping."
-        ),
-    )
-    parser.add_argument(
-        "--random_flip",
-        action="store_true",
-        help="whether to randomly flip images horizontally",
-    )
-    parser.add_argument(
-        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
-    )
-    parser.add_argument(
-        "--sample_batch_size", type=int, default=4, help="Batch size (per device) for sampling images."
-    )
-    parser.add_argument("--num_train_epochs", type=int, default=1)
-    parser.add_argument(
-        "--max_train_steps",
-        type=int,
-        default=None,
-        help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
-    )
-    parser.add_argument(
-        "--checkpointing_steps",
-        type=int,
-        default=500,
-        help=(
-            "Save a checkpoint of the training state every X updates. These checkpoints can be used both as final"
-            " checkpoints in case they are better than the last checkpoint, and are also suitable for resuming"
-            " training using `--resume_from_checkpoint`."
-        ),
-    )
-    parser.add_argument(
-        "--checkpoints_total_limit",
-        type=int,
-        default=None,
-        help=("Max number of checkpoints to store."),
-    )
-    parser.add_argument(
-        "--resume_from_checkpoint",
-        type=str,
-        default=None,
-        help=(
-            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
-            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
-        ),
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=1,
-        help="Number of updates steps to accumulate before performing a backward/update pass.",
-    )
-    parser.add_argument(
-        "--gradient_checkpointing",
-        action="store_true",
-        help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
-    )
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=1e-4,
-        help="Initial learning rate (after the potential warmup period) to use.",
-    )
-
-    parser.add_argument(
-        "--guidance_scale",
-        type=float,
-        default=3.5,
-        help="the FLUX.1 dev variant is a guidance distilled model",
-    )
-
-    parser.add_argument(
-        "--scale_lr",
-        action="store_true",
-        default=False,
-        help="Scale the learning rate by the number of GPUs, gradient accumulation steps, and batch size.",
-    )
-    parser.add_argument(
-        "--lr_scheduler",
-        type=str,
-        default="constant",
-        help=(
-            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
-            ' "constant", "constant_with_warmup"]'
-        ),
-    )
-    parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
-    )
-    parser.add_argument(
-        "--lr_num_cycles",
-        type=int,
-        default=1,
-        help="Number of hard resets of the lr in cosine_with_restarts scheduler.",
-    )
-    parser.add_argument("--lr_power", type=float, default=1.0, help="Power factor of the polynomial scheduler.")
-    parser.add_argument(
-        "--dataloader_num_workers",
-        type=int,
-        default=0,
-        help=(
-            "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
-        ),
-    )
-    parser.add_argument(
-        "--weighting_scheme",
-        type=str,
-        default="none",
-        choices=["sigma_sqrt", "logit_normal", "mode", "cosmap", "none"],
-        help=('We default to the "none" weighting scheme for uniform sampling and uniform loss'),
-    )
-    parser.add_argument(
-        "--logit_mean", type=float, default=0.0, help="mean to use when using the `'logit_normal'` weighting scheme."
-    )
-    parser.add_argument(
-        "--logit_std", type=float, default=1.0, help="std to use when using the `'logit_normal'` weighting scheme."
-    )
-    parser.add_argument(
-        "--mode_scale",
-        type=float,
-        default=1.29,
-        help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme`.",
-    )
-    parser.add_argument(
-        "--optimizer",
-        type=str,
-        default="AdamW",
-        help=('The optimizer type to use. Choose between ["AdamW", "prodigy"]'),
-    )
-
-    parser.add_argument(
-        "--use_8bit_adam",
-        action="store_true",
-        help="Whether or not to use 8-bit Adam from bitsandbytes. Ignored if optimizer is not set to AdamW",
-    )
-
-    parser.add_argument(
-        "--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam and Prodigy optimizers."
-    )
-    parser.add_argument(
-        "--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam and Prodigy optimizers."
-    )
-    parser.add_argument(
-        "--prodigy_beta3",
-        type=float,
-        default=None,
-        help="coefficients for computing the Prodigy stepsize using running averages. If set to None, "
-        "uses the value of square root of beta2. Ignored if optimizer is adamW",
-    )
-    parser.add_argument("--prodigy_decouple", type=bool, default=True, help="Use AdamW style decoupled weight decay")
-    parser.add_argument("--adam_weight_decay", type=float, default=1e-04, help="Weight decay to use for unet params")
-    parser.add_argument(
-        "--adam_weight_decay_text_encoder", type=float, default=1e-03, help="Weight decay to use for text_encoder"
-    )
-
-    parser.add_argument(
-        "--lora_layers",
-        type=str,
-        default=None,
-        help=(
-            'The transformer modules to apply LoRA training on. Please specify the layers in a comma separated. E.g. - "to_k,to_q,to_v,to_out.0" will result in lora training of attention layers only'
-        ),
-    )
-
-    parser.add_argument(
-        "--adam_epsilon",
-        type=float,
-        default=1e-08,
-        help="Epsilon value for the Adam optimizer and Prodigy optimizers.",
-    )
-
-    parser.add_argument(
-        "--prodigy_use_bias_correction",
-        type=bool,
-        default=True,
-        help="Turn on Adam's bias correction. True by default. Ignored if optimizer is adamW",
-    )
-    parser.add_argument(
-        "--prodigy_safeguard_warmup",
-        type=bool,
-        default=True,
-        help="Remove lr from the denominator of D estimate to avoid issues during warm-up stage. True by default. "
-        "Ignored if optimizer is adamW",
-    )
-    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
-    parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
-    parser.add_argument(
-        "--hub_model_id",
-        type=str,
-        default=None,
-        help="The name of the repository to keep in sync with the local `output_dir`.",
-    )
-    parser.add_argument(
-        "--logging_dir",
-        type=str,
-        default="logs",
-        help=(
-            "[TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to"
-            " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
-        ),
-    )
-    parser.add_argument(
-        "--allow_tf32",
-        action="store_true",
-        help=(
-            "Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training. For more information, see"
-            " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
-        ),
-    )
-    parser.add_argument(
-        "--cache_latents",
-        action="store_true",
-        default=False,
-        help="Cache the VAE latents",
-    )
-    parser.add_argument(
-        "--report_to",
-        type=str,
-        default="tensorboard",
-        help=(
-            'The integration to report the results and logs to. Supported platforms are `"tensorboard"`'
-            ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
-        ),
-    )
-    parser.add_argument(
-        "--mixed_precision",
-        type=str,
-        default=None,
-        choices=["no", "fp16", "bf16"],
-        help=(
-            "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
-            " 1.10.and an Nvidia Ampere GPU.  Default to the value of accelerate config of the current system or the"
-            " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
-        ),
-    )
-    parser.add_argument(
-        "--upcast_before_saving",
-        action="store_true",
-        default=False,
-        help=(
-            "Whether to upcast the trained transformer layers to float32 before saving (at the end of training). "
-            "Defaults to precision dtype used for training to save memory"
-        ),
-    )
-    parser.add_argument(
-        "--offload",
-        action="store_true",
-        help="Whether to offload the VAE and the text encoder to CPU when they are not used.",
-    )
-
-    parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
-    parser.add_argument("--enable_npu_flash_attention", action="store_true", help="Enabla Flash Attention for NPU")
-    parser.add_argument("--fsdp_text_encoder", action="store_true", help="Use FSDP for text encoder")
-
-    if input_args is not None:
-        args = parser.parse_args(input_args)
-    else:
-        args = parser.parse_args()
-
-    if args.cond_image_column is None:
-        raise ValueError(
-            "you must provide --cond_image_column for image-to-image training. Otherwise please see Flux2 text-to-image training example."
-        )
-    else:
-        assert args.image_column is not None
-        assert args.caption_column is not None
-
-    if args.dataset_name is None and args.instance_data_dir is None:
-        raise ValueError("Specify either `--dataset_name` or `--instance_data_dir`")
-
-    if args.dataset_name is not None and args.instance_data_dir is not None:
-        raise ValueError("Specify only one of `--dataset_name` or `--instance_data_dir`")
-
-    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    if env_local_rank != -1 and env_local_rank != args.local_rank:
-        args.local_rank = env_local_rank
-
-    return args
-
 
 class DreamBoothDataset(Dataset):
     """
@@ -1004,7 +558,7 @@ def collate_fn(examples):
 
 
 class BucketBatchSampler(BatchSampler):
-    def __init__(self, dataset: DreamBoothDataset, batch_size: int, drop_last: bool = False):
+    def __init__(self, dataset: Dataset, batch_size: int, drop_last: bool = False):
         if not isinstance(batch_size, int) or batch_size <= 0:
             raise ValueError("batch_size should be a positive integer value, but got batch_size={}".format(batch_size))
         if not isinstance(drop_last, bool):
@@ -1016,7 +570,14 @@ class BucketBatchSampler(BatchSampler):
 
         # Group indices by bucket
         self.bucket_indices = [[] for _ in range(len(self.dataset.buckets))]
-        for idx, (_, bucket_idx) in enumerate(self.dataset.pixel_values):
+        if hasattr(self.dataset, "bucket_indices"):
+            dataset_bucket_indices = tuple(int(bucket_idx) for bucket_idx in self.dataset.bucket_indices)
+        elif hasattr(self.dataset, "pixel_values"):
+            dataset_bucket_indices = tuple(bucket_idx for _, bucket_idx in self.dataset.pixel_values)
+        else:
+            raise AttributeError("BucketBatchSampler requires the dataset to expose bucket_indices or pixel_values")
+
+        for idx, bucket_idx in enumerate(dataset_bucket_indices):
             self.bucket_indices[bucket_idx].append(idx)
 
         self.sampler_len = 0
@@ -1113,6 +674,8 @@ def main(args):
     # If passed along, set the training seed now.
     if args.seed is not None:
         set_seed(args.seed)
+
+    comphoser_training = resolve_and_log_pilot_training(args, logger)
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -1253,34 +816,44 @@ def main(args):
         target_modules=target_modules,
     )
     transformer.add_adapter(transformer_lora_config)
+    qformer = build_pilot_qformer(
+        transformer,
+        comphoser_training=comphoser_training,
+        logger=logger,
+    )
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
         model = model._orig_mod if is_compiled_module(model) else model
         return model
 
+    transformer_cls = type(unwrap_model(transformer))
+    qformer_cls = type(unwrap_model(qformer)) if qformer is not None else None
+
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
-        transformer_cls = type(unwrap_model(transformer))
-
-        # 1) Validate and pick the transformer model
         modules_to_save: dict[str, Any] = {}
         transformer_model = None
+        qformer_model = None
+        transformer_weight_index = None
+        qformer_weight_index = None
 
-        for model in models:
+        for index, model in enumerate(models):
             if isinstance(unwrap_model(model), transformer_cls):
                 transformer_model = model
                 modules_to_save["transformer"] = model
+                transformer_weight_index = index
+            elif qformer_cls is not None and isinstance(unwrap_model(model), qformer_cls):
+                qformer_model = model
+                qformer_weight_index = index
             else:
                 raise ValueError(f"unexpected save model: {model.__class__}")
 
         if transformer_model is None:
             raise ValueError("No transformer model found in 'models'")
 
-        # 2) Optionally gather FSDP state dict once
-        state_dict = accelerator.get_state_dict(model) if is_fsdp else None
+        state_dict = accelerator.get_state_dict(transformer_model) if is_fsdp else None
 
-        # 3) Only main process materializes the LoRA state dict
         transformer_lora_layers_to_save = None
         if accelerator.is_main_process:
             peft_kwargs = {}
@@ -1295,25 +868,51 @@ def main(args):
             if is_fsdp:
                 transformer_lora_layers_to_save = _to_cpu_contiguous(transformer_lora_layers_to_save)
 
-            # make sure to pop weight so that corresponding model is not saved again
-            if weights:
-                weights.pop()
+            # Remove the transformer/controller weights so that Accelerate does not also save full model checkpoints.
+            for weight_index in sorted(
+                (
+                    index
+                    for index in (transformer_weight_index, qformer_weight_index)
+                    if index is not None and index < len(weights)
+                ),
+                reverse=True,
+            ):
+                weights.pop(weight_index)
 
             Flux2KleinPipeline.save_lora_weights(
                 output_dir,
                 transformer_lora_layers=transformer_lora_layers_to_save,
                 **_collate_lora_metadata(modules_to_save),
             )
+            if qformer_model is not None:
+                if comphoser_checkpoint_metadata is None:
+                    raise ValueError("Missing ComPhoser checkpoint metadata for Q-Former save")
+                qformer_to_save = unwrap_model(qformer_model)
+                qformer_state_dict = (
+                    accelerator.get_state_dict(qformer_model) if is_fsdp else qformer_to_save.state_dict()
+                )
+                save_pilot_qformer_checkpoint(
+                    output_dir,
+                    qformer=qformer_to_save,
+                    metadata=comphoser_checkpoint_metadata,
+                    state_dict=qformer_state_dict,
+                )
 
     def load_model_hook(models, input_dir):
         transformer_ = None
+        qformer_ = None
+        has_stage3c_qformer_checkpoint = qformer_cls is not None and has_pilot_qformer_checkpoint(input_dir)
 
         if not is_fsdp:
-            while len(models) > 0:
-                model = models.pop()
-
+            for model_index in range(len(models) - 1, -1, -1):
+                model = models[model_index]
                 if isinstance(unwrap_model(model), type(unwrap_model(transformer))):
                     transformer_ = unwrap_model(model)
+                    del models[model_index]
+                elif qformer_cls is not None and isinstance(unwrap_model(model), qformer_cls):
+                    qformer_ = unwrap_model(model)
+                    if has_stage3c_qformer_checkpoint:
+                        del models[model_index]
                 else:
                     raise ValueError(f"unexpected save model: {model.__class__}")
         else:
@@ -1322,6 +921,8 @@ def main(args):
                 subfolder="transformer",
             )
             transformer_.add_adapter(transformer_lora_config)
+            if qformer is not None:
+                qformer_ = unwrap_model(qformer)
 
         lora_state_dict = Flux2KleinPipeline.lora_state_dict(input_dir)
 
@@ -1339,11 +940,31 @@ def main(args):
                     f" {unexpected_keys}. "
                 )
 
+        if qformer_ is not None and has_stage3c_qformer_checkpoint:
+            qformer_metadata = load_pilot_qformer_checkpoint(
+                input_dir,
+                qformer=qformer_,
+                expected_task_id=comphoser_training.primary_task_id,
+            )
+            logger.info(
+                "Loaded ComPhoser Q-Former checkpoint for task %s with %s query tokens",
+                qformer_metadata["task_id"],
+                qformer_metadata["query_count"],
+            )
+        elif qformer_ is not None:
+            logger.warning(
+                "Resuming from legacy Q-Former checkpoint layout without ComPhoser metadata under %s; "
+                "falling back to Accelerate model weights.",
+                input_dir,
+            )
+
         # Make sure the trainable params are in float32. This is again needed since the base models
         # are in `weight_dtype`. More details:
         # https://github.com/huggingface/diffusers/pull/6514#discussion_r1449796804
         if args.mixed_precision == "fp16":
             models = [transformer_]
+            if qformer is not None:
+                models.append(unwrap_model(qformer))
             # only upcast trainable parameters (LoRA) into fp32
             cast_training_params(models)
 
@@ -1363,6 +984,8 @@ def main(args):
     # Make sure the trainable params are in float32.
     if args.mixed_precision == "fp16":
         models = [transformer]
+        if qformer is not None:
+            models.append(qformer)
         # only upcast trainable parameters (LoRA) into fp32
         cast_training_params(models, dtype=torch.float32)
 
@@ -1371,6 +994,9 @@ def main(args):
     # Optimization parameters
     transformer_parameters_with_lr = {"params": transformer_lora_parameters, "lr": args.learning_rate}
     params_to_optimize = [transformer_parameters_with_lr]
+    if qformer is not None:
+        qformer_parameters = list(filter(lambda p: p.requires_grad, qformer.parameters()))
+        params_to_optimize.append({"params": qformer_parameters, "lr": args.learning_rate})
 
     # Optimizer creation
     if not (args.optimizer.lower() == "prodigy" or args.optimizer.lower() == "adamw"):
@@ -1437,19 +1063,53 @@ def main(args):
     logger.info(f"Using parsed aspect ratio buckets: {buckets}")
 
     # Dataset and DataLoaders creation:
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        size=args.resolution,
-        repeats=args.repeats,
-        center_crop=args.center_crop,
-        buckets=buckets,
+    if comphoser_training.uses_prepared_pilot_dataset:
+        train_dataset = PreparedPilotDataset(
+            comphoser_training.dataset_roots[0],
+            split="train",
+            backend=args.comphoser_data_backend,
+            size=args.resolution,
+            repeats=args.repeats,
+            center_crop=args.center_crop,
+            random_flip=args.random_flip,
+            buckets=buckets,
+        )
+        collate_train_examples = collate_prepared_pilot_examples
+    else:
+        train_dataset = DreamBoothDataset(
+            instance_data_root=args.instance_data_dir,
+            instance_prompt=args.instance_prompt,
+            size=args.resolution,
+            repeats=args.repeats,
+            center_crop=args.center_crop,
+            buckets=buckets,
+        )
+        collate_train_examples = collate_fn
+
+    uses_comphoser_preprocessed_backend = bool(
+        comphoser_training.uses_prepared_pilot_dataset and getattr(train_dataset, "uses_preprocessed_backend", False)
+    )
+    uses_comphoser_raw_backend = bool(
+        comphoser_training.uses_prepared_pilot_dataset and getattr(train_dataset, "uses_raw_backend", False)
+    )
+    use_static_instance_prompt = (not comphoser_training.uses_prepared_pilot_dataset) and not train_dataset.custom_instance_prompts
+    precompute_prompt_embeddings = (not comphoser_training.uses_prepared_pilot_dataset) and bool(
+        train_dataset.custom_instance_prompts
+    )
+    precompute_image_latents = args.cache_latents and not uses_comphoser_preprocessed_backend
+    keep_text_encoding_pipeline = uses_comphoser_raw_backend
+
+    comphoser_checkpoint_metadata = build_pilot_checkpoint_metadata(
+        args,
+        train_dataset=train_dataset,
+        qformer=qformer,
+        comphoser_training=comphoser_training,
     )
     batch_sampler = BucketBatchSampler(train_dataset, batch_size=args.train_batch_size, drop_last=True)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_sampler=batch_sampler,
-        collate_fn=lambda examples: collate_fn(examples),
+        collate_fn=collate_train_examples,
         num_workers=args.dataloader_num_workers,
     )
 
@@ -1463,18 +1123,23 @@ def main(args):
     # If no type of tuning is done on the text_encoder and custom instance prompts are NOT
     # provided (i.e. the --instance_prompt is used for all images), we encode the instance prompt once to avoid
     # the redundant encoding.
-    if not train_dataset.custom_instance_prompts:
+    if use_static_instance_prompt:
         with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
             instance_prompt_hidden_states, instance_text_ids = compute_text_embeddings(
                 args.instance_prompt, text_encoding_pipeline
             )
 
-    if args.validation_prompt is not None:
+    validation_kwargs = None
+    if not comphoser_training.uses_prepared_pilot_dataset:
+        baseline_validation_prompt = args.validation_prompt if args.validation_prompt is not None else args.final_validation_prompt
+    else:
+        baseline_validation_prompt = None
+    if baseline_validation_prompt is not None:
         validation_image = load_image(args.validation_image).convert("RGB")
-        validation_kwargs = {"image": validation_image}
+        validation_kwargs = {"image": validation_image, "prompt_label": baseline_validation_prompt}
         with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
             validation_kwargs["prompt_embeds"], _text_ids = compute_text_embeddings(
-                args.validation_prompt, text_encoding_pipeline
+                baseline_validation_prompt, text_encoding_pipeline
             )
             validation_kwargs["negative_prompt_embeds"], _text_ids = compute_text_embeddings(
                 "", text_encoding_pipeline
@@ -1498,14 +1163,14 @@ def main(args):
     # If custom instance prompts are NOT provided (i.e. the instance prompt is used for all images),
     # pack the statically computed variables appropriately here. This is so that we don't
     # have to pass them to the dataloader.
-    if not train_dataset.custom_instance_prompts:
+    if use_static_instance_prompt:
         prompt_embeds = instance_prompt_hidden_states
         text_ids = instance_text_ids
 
     # if cache_latents is set to True, we encode images to latents and store them.
     # Similar to pre-encoding in the case of a single instance prompt, if custom prompts are provided
     # we encode them in advance as well.
-    precompute_latents = args.cache_latents or train_dataset.custom_instance_prompts
+    precompute_latents = precompute_image_latents or precompute_prompt_embeddings
     if precompute_latents:
         prompt_embeds_cache = []
         text_ids_cache = []
@@ -1513,7 +1178,7 @@ def main(args):
         cond_latents_cache = []
         for batch in tqdm(train_dataloader, desc="Caching latents"):
             with torch.no_grad():
-                if args.cache_latents:
+                if precompute_image_latents:
                     with offload_models(vae, device=accelerator.device, offload=args.offload):
                         batch["pixel_values"] = batch["pixel_values"].to(
                             accelerator.device, non_blocking=True, dtype=vae.dtype
@@ -1523,7 +1188,7 @@ def main(args):
                             accelerator.device, non_blocking=True, dtype=vae.dtype
                         )
                         cond_latents_cache.append(vae.encode(batch["cond_pixel_values"]).latent_dist)
-                if train_dataset.custom_instance_prompts:
+                if precompute_prompt_embeddings:
                     if args.fsdp_text_encoder:
                         prompt_embeds, text_ids = compute_text_embeddings(batch["prompts"], text_encoding_pipeline)
                     else:
@@ -1533,13 +1198,17 @@ def main(args):
                     text_ids_cache.append(text_ids)
 
     # move back to cpu before deleting to ensure memory is freed see: https://github.com/huggingface/diffusers/issues/11376#issue-3008144624
-    if args.cache_latents:
+    if precompute_image_latents or uses_comphoser_preprocessed_backend:
         vae = vae.to("cpu")
         del vae
 
-    # move back to cpu before deleting to ensure memory is freed see: https://github.com/huggingface/diffusers/issues/11376#issue-3008144624
-    text_encoding_pipeline = text_encoding_pipeline.to("cpu")
-    del text_encoder, tokenizer
+    if keep_text_encoding_pipeline:
+        if not args.fsdp_text_encoder:
+            text_encoding_pipeline = text_encoding_pipeline.to("cpu")
+    else:
+        # move back to cpu before deleting to ensure memory is freed see: https://github.com/huggingface/diffusers/issues/11376#issue-3008144624
+        text_encoding_pipeline = text_encoding_pipeline.to("cpu")
+        del text_encoder, tokenizer
     free_memory()
 
     # Scheduler and math around the number of training steps.
@@ -1564,9 +1233,14 @@ def main(args):
     )
 
     # Prepare everything with our `accelerator`.
-    transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        transformer, optimizer, train_dataloader, lr_scheduler
-    )
+    if qformer is not None:
+        transformer, qformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            transformer, qformer, optimizer, train_dataloader, lr_scheduler
+        )
+    else:
+        transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            transformer, optimizer, train_dataloader, lr_scheduler
+        )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1585,7 +1259,15 @@ def main(args):
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         tracker_name = "dreambooth-flux2-image2img-lora"
-        accelerator.init_trackers(tracker_name, config=vars(args))
+        tracker_config = {}
+        for key, value in vars(args).items():
+            if isinstance(value, (bool, int, float, str, torch.Tensor)):
+                tracker_config[key] = value
+            elif value is None:
+                tracker_config[key] = "null"
+            else:
+                tracker_config[key] = json.dumps(value)
+        accelerator.init_trackers(tracker_name, config=tracker_config)
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1648,15 +1330,149 @@ def main(args):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
+    def build_validation_transformer_lora_state_dict(
+        *,
+        fsdp_state_dict: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        peft_kwargs = {}
+        if fsdp_state_dict is not None:
+            peft_kwargs["state_dict"] = fsdp_state_dict
+        return {
+            key: value.detach().cpu().contiguous() if isinstance(value, torch.Tensor) else value
+            for key, value in get_peft_model_state_dict(unwrap_model(transformer), **peft_kwargs).items()
+        }
+
+    def build_validation_qformer_state_dict(
+        *,
+        fsdp_state_dict: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        if qformer is None:
+            return None
+        source_state_dict = fsdp_state_dict if fsdp_state_dict is not None else unwrap_model(qformer).state_dict()
+        return {
+            key: value.detach().cpu().contiguous() if isinstance(value, torch.Tensor) else value
+            for key, value in source_state_dict.items()
+        }
+
+    def run_periodic_validation(step_index: int) -> None:
+        should_run_validation = (
+            args.validation_steps is not None
+            and args.validation_steps > 0
+            and (
+                (
+                    not comphoser_training.uses_prepared_pilot_dataset
+                    and args.validation_prompt is not None
+                    and validation_kwargs is not None
+                )
+                or (
+                    comphoser_training.uses_prepared_pilot_dataset
+                    and args.comphoser_validation_mode != "off"
+                )
+            )
+        )
+        if not should_run_validation:
+            return
+
+        validation_transformer_lora_state_dict = None
+        validation_qformer_state_dict = None
+        if is_fsdp:
+            validation_transformer_lora_state_dict = build_validation_transformer_lora_state_dict(
+                fsdp_state_dict=accelerator.get_state_dict(transformer),
+            )
+            if qformer is not None:
+                validation_qformer_state_dict = build_validation_qformer_state_dict(
+                    fsdp_state_dict=accelerator.get_state_dict(qformer),
+                )
+
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            if comphoser_training.uses_prepared_pilot_dataset:
+                if validation_transformer_lora_state_dict is None:
+                    validation_transformer_lora_state_dict = build_validation_transformer_lora_state_dict()
+                validation_qformer = None
+                if qformer is not None:
+                    if validation_qformer_state_dict is None:
+                        validation_qformer_state_dict = build_validation_qformer_state_dict()
+                    validation_qformer = build_detached_validation_qformer(
+                        unwrap_model(qformer),
+                        state_dict=validation_qformer_state_dict,
+                    )
+                pipeline = build_detached_validation_pipeline(
+                    pretrained_model_name_or_path=args.pretrained_model_name_or_path,
+                    revision=args.revision,
+                    variant=args.variant,
+                    torch_dtype=weight_dtype,
+                    transformer_lora_config=transformer_lora_config,
+                    transformer_lora_state_dict=validation_transformer_lora_state_dict,
+                    include_text_encoder=True,
+                    enable_model_cpu_offload=True,
+                    logger=logger,
+                )
+                run_comphoser_validation(
+                    args.output_dir,
+                    args=args,
+                    pipelines_by_mode={args.comphoser_mode: pipeline},
+                    comphoser_training=comphoser_training,
+                    qformer=validation_qformer,
+                    logger=logger,
+                    artifact_subdir=f"periodic_validation/step_{step_index:06d}",
+                )
+            else:
+                if validation_transformer_lora_state_dict is None:
+                    validation_transformer_lora_state_dict = build_validation_transformer_lora_state_dict()
+                pipeline = build_detached_validation_pipeline(
+                    pretrained_model_name_or_path=args.pretrained_model_name_or_path,
+                    revision=args.revision,
+                    variant=args.variant,
+                    torch_dtype=weight_dtype,
+                    transformer_lora_config=transformer_lora_config,
+                    transformer_lora_state_dict=validation_transformer_lora_state_dict,
+                    include_text_encoder=False,
+                    enable_model_cpu_offload=False,
+                    logger=logger,
+                )
+                log_validation(
+                    pipeline=pipeline,
+                    args=args,
+                    accelerator=accelerator,
+                    pipeline_args=validation_kwargs,
+                    epoch=step_index,
+                    torch_dtype=weight_dtype,
+                )
+
+            del pipeline
+            free_memory()
+        accelerator.wait_for_everyone()
+
+    if initial_global_step == 0:
+        run_periodic_validation(0)
+
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
+        if qformer is not None:
+            qformer.train()
 
         for step, batch in enumerate(train_dataloader):
             models_to_accumulate = [transformer]
+            if qformer is not None:
+                models_to_accumulate.append(qformer)
             prompts = batch["prompts"]
 
             with accelerator.accumulate(models_to_accumulate):
-                if train_dataset.custom_instance_prompts:
+                if uses_comphoser_preprocessed_backend:
+                    prompt_embeds = batch["prompt_embeds"].to(
+                        device=accelerator.device,
+                        non_blocking=True,
+                        dtype=weight_dtype,
+                    )
+                    text_ids = batch["text_ids"].to(device=accelerator.device, non_blocking=True)
+                elif uses_comphoser_raw_backend:
+                    if args.fsdp_text_encoder:
+                        prompt_embeds, text_ids = compute_text_embeddings(prompts, text_encoding_pipeline)
+                    else:
+                        with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
+                            prompt_embeds, text_ids = compute_text_embeddings(prompts, text_encoding_pipeline)
+                elif precompute_prompt_embeddings:
                     prompt_embeds = prompt_embeds_cache[step]
                     text_ids = text_ids_cache[step]
                 else:
@@ -1665,7 +1481,18 @@ def main(args):
                     text_ids = text_ids.repeat(num_repeat_elements, 1, 1)
 
                 # Convert images to latent space
-                if args.cache_latents:
+                if uses_comphoser_preprocessed_backend:
+                    model_input = batch["latents"].to(
+                        device=accelerator.device,
+                        non_blocking=True,
+                        dtype=latents_bn_mean.dtype,
+                    )
+                    cond_model_input = batch["cond_latents"].to(
+                        device=accelerator.device,
+                        non_blocking=True,
+                        dtype=latents_bn_mean.dtype,
+                    )
+                elif precompute_image_latents:
                     model_input = latents_cache[step].mode()
                     cond_model_input = cond_latents_cache[step].mode()
                 else:
@@ -1722,6 +1549,23 @@ def main(args):
                 packed_noisy_model_input = torch.cat([packed_noisy_model_input, packed_cond_model_input], dim=1)
                 model_input_ids = torch.cat([model_input_ids, cond_model_input_ids], dim=1)
 
+                conditioning = prepare_pilot_transformer_conditioning(
+                    prompt_embeds,
+                    text_ids,
+                    packed_cond_model_input,
+                    qformer=qformer,
+                    task_id=comphoser_training.primary_task_id,
+                    task_strengths=(
+                        resolve_pilot_batch_task_strengths(
+                            batch["task_ids"],
+                            batch["task_strengths"],
+                            expected_task_id=comphoser_training.primary_task_id,
+                        )
+                        if qformer is not None
+                        else None
+                    ),
+                )
+
                 # handle guidance
                 if unwrap_model(transformer).config.guidance_embeds:
                     guidance = torch.full([1], args.guidance_scale, device=accelerator.device)
@@ -1734,8 +1578,8 @@ def main(args):
                     hidden_states=packed_noisy_model_input,  # (B, image_seq_len, C)
                     timestep=timesteps / 1000,
                     guidance=guidance,
-                    encoder_hidden_states=prompt_embeds,
-                    txt_ids=text_ids,  # B, text_seq_len, 4
+                    encoder_hidden_states=conditioning.encoder_hidden_states,
+                    txt_ids=conditioning.txt_ids,  # B, text_seq_len, 4
                     img_ids=model_input_ids,  # B, image_seq_len, 4
                     return_dict=False,
                 )[0]
@@ -1762,6 +1606,8 @@ def main(args):
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     params_to_clip = transformer.parameters()
+                    if qformer is not None:
+                        params_to_clip = itertools.chain(params_to_clip, qformer.parameters())
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                 optimizer.step()
@@ -1799,44 +1645,22 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
+                if (
+                    args.validation_steps is not None
+                    and args.validation_steps > 0
+                    and global_step % args.validation_steps == 0
+                ):
+                    run_periodic_validation(global_step)
+
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            if conditioning.query_gates is not None:
+                logs["qformer_gate_mean"] = conditioning.query_gates.detach().mean().item()
+                logs["qformer_added_tokens"] = float(conditioning.added_token_count)
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
                 break
-
-        should_run_epoch_validation = (
-            args.validation_prompt is not None
-            and args.validation_epochs is not None
-            and args.validation_epochs > 0
-            and (epoch + 1) % args.validation_epochs == 0
-        )
-        if should_run_epoch_validation:
-            accelerator.wait_for_everyone()
-            if accelerator.is_main_process:
-                # create pipeline
-                pipeline = Flux2KleinPipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    text_encoder=None,
-                    tokenizer=None,
-                    transformer=unwrap_model(transformer),
-                    revision=args.revision,
-                    variant=args.variant,
-                    torch_dtype=weight_dtype,
-                )
-                images = log_validation(
-                    pipeline=pipeline,
-                    args=args,
-                    accelerator=accelerator,
-                    pipeline_args=validation_kwargs,
-                    epoch=epoch,
-                    torch_dtype=weight_dtype,
-                )
-
-                del pipeline
-                free_memory()
-            accelerator.wait_for_everyone()
 
     # Save the lora layers
     accelerator.wait_for_everyone()
@@ -1883,33 +1707,78 @@ def main(args):
             **_collate_lora_metadata(modules_to_save),
         )
 
-        images = []
-        run_validation = (args.validation_prompt and args.num_validation_images > 0) or (args.final_validation_prompt)
-        should_run_final_inference = not args.skip_final_inference and run_validation
-        if should_run_final_inference:
-            pipeline = Flux2KleinPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
-                revision=args.revision,
-                variant=args.variant,
-                torch_dtype=weight_dtype,
+        run_final_comphoser_export(
+            args,
+            comphoser_training=comphoser_training,
+            qformer=qformer,
+            qformer_state_dict=(
+                accelerator.get_state_dict(qformer) if qformer is not None and is_fsdp else unwrap_model(qformer).state_dict()
             )
-            # load attention processors
-            pipeline.load_lora_weights(args.output_dir)
+            if qformer is not None
+            else None,
+            comphoser_checkpoint_metadata=comphoser_checkpoint_metadata,
+            weight_dtype=weight_dtype,
+            unwrap_model=unwrap_model,
+            logger=logger,
+            run_validation=args.comphoser_mode == "lora_qformer" and args.comphoser_validation_mode == "batch",
+        )
 
-            # run inference
-            images = []
-            if args.validation_prompt and args.num_validation_images > 0:
-                images = log_validation(
-                    pipeline=pipeline,
-                    args=args,
-                    accelerator=accelerator,
-                    pipeline_args=validation_kwargs,
-                    epoch=epoch,
-                    is_final_validation=True,
+        images = []
+        if comphoser_training.uses_prepared_pilot_dataset:
+            should_run_final_inference = not args.skip_final_inference and (
+                args.comphoser_validation_mode != "off"
+                and (args.comphoser_mode != "lora_qformer" or args.comphoser_validation_mode == "single")
+            )
+            if should_run_final_inference:
+                pipeline = Flux2KleinPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path,
+                    revision=args.revision,
+                    variant=args.variant,
                     torch_dtype=weight_dtype,
                 )
-            del pipeline
-            free_memory()
+                pipeline.load_lora_weights(args.output_dir)
+                pipeline.enable_model_cpu_offload()
+                pipeline.set_progress_bar_config(disable=True)
+                run_comphoser_validation(
+                    args.output_dir,
+                    args=args,
+                    pipelines_by_mode={args.comphoser_mode: pipeline},
+                    comphoser_training=comphoser_training,
+                    qformer=unwrap_model(qformer) if qformer is not None else None,
+                    logger=logger,
+                    artifact_subdir="final_validation",
+                )
+                del pipeline
+                free_memory()
+        else:
+            run_validation = validation_kwargs is not None and (
+                (args.validation_prompt and args.num_validation_images > 0) or (args.final_validation_prompt)
+            )
+            should_run_final_inference = not args.skip_final_inference and run_validation
+            if should_run_final_inference:
+                pipeline = Flux2KleinPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path,
+                    revision=args.revision,
+                    variant=args.variant,
+                    torch_dtype=weight_dtype,
+                )
+                # load attention processors
+                pipeline.load_lora_weights(args.output_dir)
+
+                # run inference
+                images = []
+                if validation_kwargs is not None:
+                    images = log_validation(
+                        pipeline=pipeline,
+                        args=args,
+                        accelerator=accelerator,
+                        pipeline_args=validation_kwargs,
+                        epoch=epoch,
+                        is_final_validation=True,
+                        torch_dtype=weight_dtype,
+                    )
+                del pipeline
+                free_memory()
 
         validation_prompt = args.validation_prompt if args.validation_prompt else args.final_validation_prompt
         save_model_card(

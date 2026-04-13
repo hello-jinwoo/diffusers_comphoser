@@ -16,7 +16,7 @@ select = ["C", "E", "F", "I", "W"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2
-known-first-party = ["diffusers"]
+known-first-party = ["comphoser", "diffusers"]
 
 [tool.ruff.format]
 # Like Black, use double quotes for strings.

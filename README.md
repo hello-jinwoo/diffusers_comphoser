@@ -1,23 +1,38 @@
-# FLUX.2-Klein LoRA Img2Img Trainer
+# ComPhoser
 
-This repository is a trimmed copy of `diffusers` kept for one workflow only:
-LoRA training of FLUX.2-Klein in an image-to-image setting.
+## 1. Overview
 
-What remains:
+ComPhoser is a diffusion-based computational photography project built on top of FLUX.2 Klein. The current repository keeps the working FLUX.2 Klein image-to-image LoRA baseline and extends it with the first ComPhoser Q-Former conditioning path for a single primitive task.
 
-- core library code in `src/diffusers`
-- the trainer at `examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py`
-- the dependencies file at `examples/dreambooth/requirements_flux.txt`
+The current implemented pilot is `detail_sr_x4`, mapped from `primitive_groups=["detail"]` and backed by the rebuilt SR dataset at `data/detail_sr__RealSR_v3/`.
 
-## Setup
+## 2. Project Status
 
-FLUX.2-Klein is gated on Hugging Face. Accept the model license first, then log in:
+- [x] FLUX.2 Klein image-to-image LoRA baseline retained in this repository
+- [x] Single primitive SR pilot for `detail_sr_x4`
+- [x] Q-Former-enabled pilot training path
+- [x] Controlled validation export under `output_dir/comphoser/controlled_validation/`
+- [ ] Multiple primitive training
+- [ ] Downstream task training on top of primitives
+
+Notes:
+
+- The first real `lora_only` SR run completed on `2026-04-10`.
+- The first real `lora_qformer` SR run completed on `2026-04-10`.
+- Periodic multi-GPU validation now rebuilds detached validation models before offload so rank `0` validation does not mutate the live training transformer or Q-Former modules.
+- The main open issue is controller behavior quality, not basic training/export wiring.
+
+## 3. Settings
+
+### Requirements
+
+Accept the gated FLUX.2 Klein license on Hugging Face, then log in:
 
 ```bash
 hf auth login
 ```
 
-Install the library and trainer dependencies:
+Install the repository and training dependencies:
 
 ```bash
 pip install -e .
@@ -27,106 +42,150 @@ accelerate config default
 
 Optional packages:
 
-- `bitsandbytes` for `--use_8bit_adam` or `--bnb_quantization_config_path`
-- `torchao` for `--do_fp8_training`
+- `bitsandbytes` for `--use_8bit_adam` or quantized loading
+- `torchao` for FP8 training paths
 - `prodigyopt` for `--optimizer=prodigy`
 - `wandb` for `--report_to=wandb`
 
-## Dataset Format
+### Dataset
 
-For paired img2img training, use `--dataset_name` with either:
+The active single-primitive dataset is:
 
-- a Hugging Face dataset id
-- a local datasets-compatible directory
+- `data/detail_sr__RealSR_v3/`
 
-Your dataset should expose three columns:
+Current validated dataset state:
 
-- target image
-- conditioning image
-- instruction or caption
+- `train`: 400 paired samples
+- `val`: 100 paired samples
+- both splits contain `original/`, `raw/`, and `preprocessed/`
 
-Pass those column names with:
+Dataset naming follows:
 
-- `--image_column`
-- `--cond_image_column`
-- `--caption_column`
-
-## Example
-
-Download a tiny paired local dataset first:
-
-```bash
-python scripts/download_flux2_klein_lora_smoke_data.py --overwrite
+```text
+data/{group}_{task}__{dataset_name}/
 ```
 
-This writes a local `imagefolder` dataset under `./sample_data/flux2_klein_lora_smoke` with:
+Expected split structure:
 
-- target column: `image`
-- conditioning-image column: `conditioning_image`
-- prompt column: `instruction`
+```text
+data/
+  {dataname}/
+    train/
+      raw/
+        images/
+          input/
+          target/
+        prompt/
+      preprocessed/
+        image_latent_cache/
+          input/
+          target/
+        prompt_latent_cache/
+    val/
+      (same as train/)
+```
 
-Single-GPU end-to-end command with final inference:
+Dataset preparation flow:
+
+1. Place relocated source assets under `data/{dataname}/{train_or_val}/original/`.
+2. Build resized and renamed raw pairs.
+3. Create prompt text files under `raw/prompt/`.
+4. Build split-local latent and prompt caches under `preprocessed/`.
+
+Builders:
 
 ```bash
-accelerate launch --num_processes=1 examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py \
+PYTHONPATH=src python scripts/build_comphoser_raw_dataset.py \
+  --dataset_root data/{dataname}/{train_or_val} \
+  --pairing_mode by_name
+```
+
+```bash
+PYTHONPATH=src python scripts/build_comphoser_preprocessed_dataset.py \
+  --dataset_root data/{dataname}/{train_or_val} \
+  --pretrained_model_name_or_path black-forest-labs/FLUX.2-klein-4B
+```
+
+For ComPhoser pilot modes, the default backend is `--comphoser_data_backend preprocessed`.
+
+## 4. Training
+
+ComPhoser currently exposes three training directions.
+
+### [1] Single primitive
+
+Status: completed for SR (`detail_sr_x4`)
+
+Concrete training script:
+
+- `examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py`
+
+Run scripts:
+```bash
+bash scripts/train_detail_sr_qformer_single_gpu.sh
+```
+
+```bash
+bash scripts/train_detail_sr_qformer_multi_gpu.sh
+```
+
+The scripts expose the main knobs through environment variables such as `OUTPUT_DIR`, `CUDA_VISIBLE_DEVICES`, and `NUM_PROCESSES`.
+
+Supported pilot modes:
+
+- `baseline`: retained FLUX.2 Klein LoRA img2img path
+- `lora_only`: ComPhoser dataset routing without Q-Former conditioning
+- `lora_qformer`: ComPhoser dataset routing with the Q-Former enabled
+
+### [2] Multiple primitive
+
+Status: TODO
+
+### [3] Downstream tasks
+
+Status: TODO
+
+## 5. Inference
+
+The current supported inference surface is the ComPhoser controlled-validation path, not a separate polished standalone inference CLI.
+
+For the completed SR primitive, `lora_qformer` final export writes:
+
+- `output_dir/comphoser/metadata.json`
+- `output_dir/comphoser/shared_qformer.safetensors`
+- `output_dir/comphoser/task_query_bank.safetensors`
+- `output_dir/comphoser/controlled_validation/summary.json`
+- `output_dir/comphoser/controlled_validation/images/`
+
+`batch` validation is the default inference-style export for the SR pilot. It runs only the active mode for the current training run:
+
+- `baseline -> flux_only`
+- `lora_only -> lora_only`
+- `lora_qformer -> lora_qformer`
+
+For each selected validation sample it writes:
+
+- `{image_id}_input.png`
+- `{image_id}_output_1.png`, `{image_id}_output_2.png`, ...
+- `{image_id}_gt.png`
+- `{image_id}_all.png`
+
+`--num_validation_images` controls how many validation input samples are processed in ComPhoser batch validation, and `--num_validation_seeds_per_image` controls how many seeded outputs are generated per sample.
+
+Optional single-case validation remains available:
+
+```bash
+PYTHONPATH=src python -m comphoser.cli.train \
   --pretrained_model_name_or_path=black-forest-labs/FLUX.2-klein-4B \
-  --dataset_name=./sample_data/flux2_klein_lora_smoke \
-  --image_column=image \
-  --cond_image_column=conditioning_image \
-  --caption_column=instruction \
-  --output_dir=./runs/flux2-klein-img2img-lora-end2end-single-gpu \
-  --cache_latents \
-  --gradient_checkpointing \
-  --mixed_precision=bf16 \
-  --resolution=512 \
-  --train_batch_size=1 \
-  --guidance_scale=1 \
-  --gradient_accumulation_steps=1 \
-  --optimizer=AdamW \
-  --learning_rate=1e-4 \
-  --lr_scheduler=constant \
-  --lr_warmup_steps=0 \
-  --max_train_steps=10 \
-  --rank=8 \
-  --seed=0 \
-  --dataloader_num_workers=0 \
-  --validation_prompt="restore the butterfly photo from the blurred low-resolution reference while preserving natural wing patterns and color" \
-  --validation_image=./sample_data/flux2_klein_lora_smoke/train/conditioning/000.png \
-  --num_validation_images=1 \
-  --validation_epochs=10
+  --output_dir=./runs/detail_sr_single_validation \
+  --comphoser_mode lora_qformer \
+  --comphoser_primitive_groups detail \
+  --comphoser_validation_mode single \
+  --validation_prompt "restore fine detail conservatively" \
+  --validation_image ./some_validation_input.png \
+  --num_validation_seeds_per_image 2
 ```
 
-Multi-GPU end-to-end command with final inference:
+Current limitation:
 
-```bash
-accelerate launch --multi_gpu --num_processes=2 examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py \
-  --pretrained_model_name_or_path=black-forest-labs/FLUX.2-klein-4B \
-  --dataset_name=./sample_data/flux2_klein_lora_smoke \
-  --image_column=image \
-  --cond_image_column=conditioning_image \
-  --caption_column=instruction \
-  --output_dir=./runs/flux2-klein-img2img-lora-end2end-multi-gpu \
-  --cache_latents \
-  --gradient_checkpointing \
-  --mixed_precision=bf16 \
-  --resolution=512 \
-  --train_batch_size=1 \
-  --guidance_scale=1 \
-  --gradient_accumulation_steps=1 \
-  --optimizer=AdamW \
-  --learning_rate=1e-4 \
-  --lr_scheduler=constant \
-  --lr_warmup_steps=0 \
-  --max_train_steps=10 \
-  --rank=8 \
-  --seed=0 \
-  --dataloader_num_workers=0 \
-  --validation_prompt="restore the butterfly photo from the blurred low-resolution reference while preserving natural wing patterns and color" \
-  --validation_image=./sample_data/flux2_klein_lora_smoke/train/conditioning/000.png \
-  --num_validation_images=1 \
-  --validation_epochs=10
-```
-
-The distributed synchronization fix in the trainer keeps the other ranks waiting correctly while rank 0 runs validation or final inference, so this end-to-end variant should finish cleanly instead of hanging at the end.
-
-Use `black-forest-labs/FLUX.2-klein-9B` instead if you want the 9B variant.
+- multi-primitive composed inference is not implemented yet
