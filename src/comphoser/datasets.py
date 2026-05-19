@@ -8,14 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import numpy as np
 import torch
 from PIL import Image
-from PIL.ImageOps import exif_transpose
 from torch import Tensor
 from torch.utils.data import Dataset
+from torch.utils.data.sampler import BatchSampler
 
-from .controls import get_task_spec_for_dataset_id
+from .controls import PILOT_PRIMITIVE_FAMILY_ORDER, get_task_spec_for_dataset_id
+from .image_utils import load_rgb_image, paired_image_transform
 from .preprocessing import build_preprocessed_sample_paths, discover_raw_paired_samples, read_prompt_text
 
 COMPHOSER_DATA_BACKENDS = ("preprocessed", "raw")
@@ -124,6 +124,22 @@ class PreparedPilotDataset(Dataset):
     def uses_raw_backend(self) -> bool:
         return self.backend == "raw"
 
+    @property
+    def repeated_records(self) -> tuple[PreparedPilotRecord, ...]:
+        return self._repeated_records
+
+    @property
+    def dataset_ids(self) -> tuple[str, ...]:
+        return (self.metadata.dataset_id,)
+
+    @property
+    def record_source(self) -> str:
+        return self.metadata.record_source
+
+    @property
+    def primitive_group_labels(self) -> tuple[str | None, ...]:
+        return tuple(record.primitive_family for record in self._repeated_records)
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self._repeated_records[index]
         bucket_idx = self.bucket_indices[index]
@@ -156,9 +172,9 @@ class PreparedPilotDataset(Dataset):
             return example
 
         bucket_size = self.buckets[bucket_idx]
-        instance_image = _load_rgb_image(record.image_path)
-        cond_image = _load_rgb_image(record.cond_image_path)
-        instance_tensor, cond_tensor = _paired_transform(
+        instance_image = load_rgb_image(record.image_path)
+        cond_image = load_rgb_image(record.cond_image_path)
+        instance_tensor, cond_tensor = paired_image_transform(
             instance_image,
             cond_image,
             size=bucket_size,
@@ -177,6 +193,257 @@ class PreparedPilotDataset(Dataset):
         with Image.open(record.image_path) as image:
             width, height = image.size
         return find_nearest_bucket(height, width, self.buckets)
+
+
+class MultiPreparedPilotDataset(Dataset):
+    """Flatten several prepared pilot datasets behind one trainer-facing dataset."""
+
+    def __init__(self, datasets: Sequence[PreparedPilotDataset]) -> None:
+        normalized_datasets = tuple(datasets)
+        if not normalized_datasets:
+            raise ValueError("MultiPreparedPilotDataset requires at least one child dataset")
+
+        reference = normalized_datasets[0]
+        self.datasets = normalized_datasets
+        self.backend = reference.backend
+        self.buckets = reference.buckets
+        self.size = reference.size
+        self.center_crop = reference.center_crop
+        self.random_flip = reference.random_flip
+
+        self.dataset_ids = tuple(
+            dict.fromkeys(dataset_id for dataset in self.datasets for dataset_id in dataset.dataset_ids)
+        )
+        self.record_sources = tuple(
+            dict.fromkeys(str(dataset.record_source) for dataset in self.datasets)
+        )
+        if len(self.record_sources) != 1:
+            raise ValueError(
+                "MultiPreparedPilotDataset requires all children to share one record_source, "
+                f"received: {self.record_sources}"
+            )
+        self.record_source = self.record_sources[0]
+
+        self.records = tuple(record for dataset in self.datasets for record in dataset.records)
+        self._index_map = tuple(
+            (dataset_index, local_index)
+            for dataset_index, dataset in enumerate(self.datasets)
+            for local_index in range(len(dataset))
+        )
+        self.bucket_indices = tuple(
+            bucket_idx
+            for dataset in self.datasets
+            for bucket_idx in dataset.bucket_indices
+        )
+        self.custom_instance_prompts = [
+            prompt
+            for dataset in self.datasets
+            for prompt in dataset.custom_instance_prompts
+        ]
+        self.primitive_group_labels = tuple(
+            record.primitive_family
+            for dataset in self.datasets
+            for record in dataset.repeated_records
+        )
+
+        for dataset in self.datasets[1:]:
+            if dataset.backend != self.backend:
+                raise ValueError("MultiPreparedPilotDataset requires one shared backend across all children")
+            if dataset.buckets != self.buckets:
+                raise ValueError("MultiPreparedPilotDataset requires identical bucket definitions across all children")
+
+    def __len__(self) -> int:
+        return len(self._index_map)
+
+    @property
+    def uses_preprocessed_backend(self) -> bool:
+        return self.backend == "preprocessed"
+
+    @property
+    def uses_raw_backend(self) -> bool:
+        return self.backend == "raw"
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        dataset_index, local_index = self._index_map[index]
+        return self.datasets[dataset_index][local_index]
+
+
+class BucketBatchSampler(BatchSampler):
+    def __init__(self, dataset: Dataset, batch_size: int, drop_last: bool = False):
+        if not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError(f"batch_size should be a positive integer value, but got batch_size={batch_size}")
+        if not isinstance(drop_last, bool):
+            raise ValueError(f"drop_last should be a boolean value, but got drop_last={drop_last}")
+
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+
+        self.bucket_indices = [[] for _ in range(len(self.dataset.buckets))]
+        if hasattr(self.dataset, "bucket_indices"):
+            dataset_bucket_indices = tuple(int(bucket_idx) for bucket_idx in self.dataset.bucket_indices)
+        elif hasattr(self.dataset, "pixel_values"):
+            dataset_bucket_indices = tuple(bucket_idx for _, bucket_idx in self.dataset.pixel_values)
+        else:
+            raise AttributeError("BucketBatchSampler requires the dataset to expose bucket_indices or pixel_values")
+
+        for idx, bucket_idx in enumerate(dataset_bucket_indices):
+            self.bucket_indices[bucket_idx].append(idx)
+
+        self.sampler_len = 0
+        self.batches: list[list[int]] = []
+        for indices_in_bucket in self.bucket_indices:
+            random.shuffle(indices_in_bucket)
+            for i in range(0, len(indices_in_bucket), self.batch_size):
+                batch = indices_in_bucket[i : i + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                self.batches.append(batch)
+                self.sampler_len += 1
+
+    def __iter__(self):
+        random.shuffle(self.batches)
+        for batch in self.batches:
+            yield batch
+
+    def __len__(self):
+        return self.sampler_len
+
+
+class PrimitiveGroupBalancedBucketBatchSampler(BatchSampler):
+    """Yield same-bucket batches while balancing primitive-group frequency exactly."""
+
+    def __init__(
+        self,
+        dataset: PreparedPilotDataset | MultiPreparedPilotDataset,
+        batch_size: int,
+        drop_last: bool = False,
+        *,
+        seed: int = 0,
+    ) -> None:
+        if not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError(f"batch_size should be a positive integer value, but got batch_size={batch_size}")
+        if not isinstance(drop_last, bool):
+            raise ValueError(f"drop_last should be a boolean value, but got drop_last={drop_last}")
+
+        primitive_group_labels = getattr(dataset, "primitive_group_labels", None)
+        bucket_indices = getattr(dataset, "bucket_indices", None)
+        buckets = getattr(dataset, "buckets", None)
+        if primitive_group_labels is None or bucket_indices is None or buckets is None:
+            raise AttributeError(
+                "PrimitiveGroupBalancedBucketBatchSampler requires the dataset to expose "
+                "primitive_group_labels, bucket_indices, and buckets"
+            )
+
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.seed = int(seed)
+        self._epoch = 0
+
+        group_to_bucket_indices: dict[str, dict[int, list[int]]] = {}
+        for index, (primitive_group, bucket_idx) in enumerate(zip(primitive_group_labels, bucket_indices)):
+            if primitive_group is None:
+                raise ValueError(
+                    "PrimitiveGroupBalancedBucketBatchSampler requires every row to expose a primitive-family label"
+                )
+            group_to_bucket_indices.setdefault(str(primitive_group), {}).setdefault(int(bucket_idx), []).append(index)
+
+        if not group_to_bucket_indices:
+            raise ValueError("PrimitiveGroupBalancedBucketBatchSampler requires at least one non-empty primitive group")
+
+        self.primitive_groups = tuple(
+            sorted(group_to_bucket_indices, key=lambda group: PILOT_PRIMITIVE_FAMILY_ORDER.index(group))
+        )
+        self.group_to_bucket_indices = {
+            primitive_group: {
+                bucket_idx: tuple(indices)
+                for bucket_idx, indices in sorted(bucket_map.items())
+                if indices
+            }
+            for primitive_group, bucket_map in group_to_bucket_indices.items()
+        }
+        self.group_counts = {
+            primitive_group: sum(len(indices) for indices in bucket_map.values())
+            for primitive_group, bucket_map in self.group_to_bucket_indices.items()
+        }
+        self.target_batches_per_group = max(
+            max(1, self._batch_count_for_group(group_count))
+            for group_count in self.group_counts.values()
+        )
+        self.sampler_len = self.target_batches_per_group * len(self.primitive_groups)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self._epoch)
+        group_schedule = [
+            primitive_group
+            for primitive_group in self.primitive_groups
+            for _ in range(self.target_batches_per_group)
+        ]
+        rng.shuffle(group_schedule)
+
+        bucket_state = {
+            primitive_group: {
+                bucket_idx: self._new_bucket_cycle(indices, rng)
+                for bucket_idx, indices in bucket_map.items()
+            }
+            for primitive_group, bucket_map in self.group_to_bucket_indices.items()
+        }
+
+        for primitive_group in group_schedule:
+            bucket_idx = self._sample_bucket_index(primitive_group, rng)
+            batch = self._draw_batch(
+                primitive_group=primitive_group,
+                bucket_idx=bucket_idx,
+                bucket_state=bucket_state,
+                rng=rng,
+            )
+            if len(batch) < self.batch_size and self.drop_last:
+                continue
+            yield batch
+
+        self._epoch += 1
+
+    def __len__(self) -> int:
+        return self.sampler_len
+
+    def _batch_count_for_group(self, group_count: int) -> int:
+        if self.drop_last:
+            return group_count // self.batch_size
+        return (group_count + self.batch_size - 1) // self.batch_size
+
+    def _sample_bucket_index(self, primitive_group: str, rng: random.Random) -> int:
+        bucket_map = self.group_to_bucket_indices[primitive_group]
+        bucket_indices = tuple(bucket_map)
+        bucket_weights = [len(bucket_map[bucket_idx]) for bucket_idx in bucket_indices]
+        return rng.choices(bucket_indices, weights=bucket_weights, k=1)[0]
+
+    def _draw_batch(
+        self,
+        *,
+        primitive_group: str,
+        bucket_idx: int,
+        bucket_state: dict[str, dict[int, dict[str, Any]]],
+        rng: random.Random,
+    ) -> list[int]:
+        state = bucket_state[primitive_group][bucket_idx]
+        batch: list[int] = []
+        while len(batch) < self.batch_size:
+            if state["position"] >= len(state["indices"]):
+                state.update(self._new_bucket_cycle(state["source_indices"], rng))
+            batch.append(state["indices"][state["position"]])
+            state["position"] += 1
+        return batch
+
+    @staticmethod
+    def _new_bucket_cycle(indices: Sequence[int], rng: random.Random) -> dict[str, Any]:
+        shuffled_indices = list(indices)
+        rng.shuffle(shuffled_indices)
+        return {
+            "indices": tuple(shuffled_indices),
+            "position": 0,
+            "source_indices": tuple(indices),
+        }
 
 
 def load_prepared_pilot_dataset_metadata(dataset_root: str | Path) -> PreparedPilotDatasetMetadata:
@@ -699,62 +966,16 @@ def _normalize_buckets(
     return tuple(normalized)
 
 
-def _load_rgb_image(path: Path) -> Image.Image:
-    with Image.open(path) as image:
-        image = exif_transpose(image)
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-        else:
-            image = image.copy()
-    return image
-
-
-def _paired_transform(
-    image: Image.Image,
-    cond_image: Image.Image,
-    *,
-    size: tuple[int, int],
-    center_crop: bool,
-    random_flip: bool,
-) -> tuple[Tensor, Tensor]:
-    target_width = size[1]
-    target_height = size[0]
-    image = image.resize((target_width, target_height), resample=Image.BILINEAR)
-    cond_image = cond_image.resize((target_width, target_height), resample=Image.BILINEAR)
-
-    if center_crop:
-        image = _center_crop(image, size)
-        cond_image = _center_crop(cond_image, size)
-
-    if random_flip and random.random() < 0.5:
-        image = image.transpose(Image.FLIP_LEFT_RIGHT)
-        cond_image = cond_image.transpose(Image.FLIP_LEFT_RIGHT)
-
-    return _image_to_tensor(image), _image_to_tensor(cond_image)
-
-
-def _center_crop(image: Image.Image, size: tuple[int, int]) -> Image.Image:
-    target_height, target_width = size
-    width, height = image.size
-    left = max((width - target_width) // 2, 0)
-    top = max((height - target_height) // 2, 0)
-    return image.crop((left, top, left + target_width, top + target_height))
-
-
-def _image_to_tensor(image: Image.Image) -> Tensor:
-    array = np.asarray(image, dtype=np.float32) / 255.0
-    if array.ndim == 2:
-        array = np.repeat(array[:, :, None], 3, axis=2)
-    tensor = torch.from_numpy(array).permute(2, 0, 1).contiguous()
-    return tensor.sub(0.5).div(0.5)
-
 
 __all__ = [
+    "BucketBatchSampler",
     "COMPHOSER_DATA_BACKENDS",
+    "MultiPreparedPilotDataset",
     "PREPARED_PRIMITIVE_FORMAT_VERSION",
     "PREPARED_PRIMITIVE_METADATA_FILENAME",
     "PREPARED_RECORD_SOURCE_DERIVED_CONTRACT",
     "PREPARED_RECORD_SOURCE_MANIFEST",
+    "PrimitiveGroupBalancedBucketBatchSampler",
     "PreparedPilotDataset",
     "PreparedPilotDatasetMetadata",
     "PreparedPilotRecord",

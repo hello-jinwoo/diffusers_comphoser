@@ -1,38 +1,31 @@
 # ComPhoser
 
-## 1. Overview
+ComPhoser is a FLUX.2 Klein image-to-image training repo with a ComPhoser Q-Former control path for computational photography primitives.
 
-ComPhoser is a diffusion-based computational photography project built on top of FLUX.2 Klein. The current repository keeps the working FLUX.2 Klein image-to-image LoRA baseline and extends it with the first ComPhoser Q-Former conditioning path for a single primitive task.
+Current supported primitive groups:
 
-The current implemented pilot is `detail_sr_x4`, mapped from `primitive_groups=["detail"]` and backed by the rebuilt SR dataset at `data/detail_sr__RealSR_v3/`.
+- `detail`
+- `tone`
+- `exposure`
+- `depth`
 
-## 2. Project Status
+If you only need to get started, follow the sections in this order:
 
-- [x] FLUX.2 Klein image-to-image LoRA baseline retained in this repository
-- [x] Single primitive SR pilot for `detail_sr_x4`
-- [x] Q-Former-enabled pilot training path
-- [x] Controlled validation export under `output_dir/comphoser/controlled_validation/`
-- [ ] Multiple primitive training
-- [ ] Downstream task training on top of primitives
+1. `Setup`
+2. `Prepare A Dataset`
+3. `Train`
+4. `Check Outputs`
+5. `Evaluate A Checkpoint`
 
-Notes:
+## Setup
 
-- The first real `lora_only` SR run completed on `2026-04-10`.
-- The first real `lora_qformer` SR run completed on `2026-04-10`.
-- Periodic multi-GPU validation now rebuilds detached validation models before offload so rank `0` validation does not mutate the live training transformer or Q-Former modules.
-- The main open issue is controller behavior quality, not basic training/export wiring.
-
-## 3. Settings
-
-### Requirements
-
-Accept the gated FLUX.2 Klein license on Hugging Face, then log in:
+Accept the gated FLUX.2 Klein license on Hugging Face, then authenticate:
 
 ```bash
 hf auth login
 ```
 
-Install the repository and training dependencies:
+Install the repo and training dependencies:
 
 ```bash
 pip install -e .
@@ -42,30 +35,42 @@ accelerate config default
 
 Optional packages:
 
-- `bitsandbytes` for `--use_8bit_adam` or quantized loading
-- `torchao` for FP8 training paths
+- `bitsandbytes` for 8-bit optimizer or quantized loading
+- `torchao` for FP8 paths
 - `prodigyopt` for `--optimizer=prodigy`
-- `wandb` for `--report_to=wandb`
+- `wandb` for experiment logging
 
-### Dataset
+## What You Can Run Today
 
-The active single-primitive dataset is:
+Training modes:
 
-- `data/detail_sr__RealSR_v3/`
+- `baseline`: retained FLUX.2 Klein LoRA img2img path
+- `lora_only`: ComPhoser dataset/runtime path without Q-Former conditioning
+- `lora_qformer`: ComPhoser dataset/runtime path with the fixed-bank Q-Former
 
-Current validated dataset state:
+Canonical primitive groups:
 
-- `train`: 400 paired samples
-- `val`: 100 paired samples
-- both splits contain `original/`, `raw/`, and `preprocessed/`
+- `detail`
+- `tone`
+- `exposure`
+- `depth`
 
-Dataset naming follows:
+Notes:
+
+- Use `tone`, not `tone_color`. `tone_color` is only a compatibility alias.
+- The current controller is a fixed-bank v1 design: `4` families x `4` query slots = `16` total query tokens.
+- Current training is dataset-backed for all four groups, but supervision still assumes at most one active primitive family per sample.
+- Controlled-validation summaries use schema `comphoser-controlled-validation-v6` and report PSNR, SSIM, mean CIEDE2000 Delta E, and Q-Former gate diagnostics when available.
+
+## Prepare A Dataset
+
+ComPhoser datasets follow this naming pattern:
 
 ```text
 data/{group}_{task}__{dataset_name}/
 ```
 
-Expected split structure:
+Expected layout per split:
 
 ```text
 data/
@@ -82,17 +87,17 @@ data/
           target/
         prompt_latent_cache/
     val/
-      (same as train/)
+      raw/
+      preprocessed/
 ```
 
-Dataset preparation flow:
+Recommended flow:
 
-1. Place relocated source assets under `data/{dataname}/{train_or_val}/original/`.
-2. Build resized and renamed raw pairs.
-3. Create prompt text files under `raw/prompt/`.
-4. Build split-local latent and prompt caches under `preprocessed/`.
+1. Create the contract-aligned `raw/` pairs and prompt files.
+2. Build the `preprocessed/` latent caches.
+3. Use `--comphoser_data_backend preprocessed` for training.
 
-Builders:
+Build `raw/` for a split:
 
 ```bash
 PYTHONPATH=src python scripts/build_comphoser_raw_dataset.py \
@@ -100,92 +105,231 @@ PYTHONPATH=src python scripts/build_comphoser_raw_dataset.py \
   --pairing_mode by_name
 ```
 
+Build `preprocessed/` for a split:
+
 ```bash
 PYTHONPATH=src python scripts/build_comphoser_preprocessed_dataset.py \
   --dataset_root data/{dataname}/{train_or_val} \
   --pretrained_model_name_or_path black-forest-labs/FLUX.2-klein-4B
 ```
 
-For ComPhoser pilot modes, the default backend is `--comphoser_data_backend preprocessed`.
+Current validated dataset-backed roots in this checkout:
 
-## 4. Training
+- `data/detail_sr__RealSR_v3/`
+- `data/tone_style__FilmSet/`
+- `data/exposure_ec__MSEC/`
+- `data/depth_bokeh__RealBokeh/`
 
-ComPhoser currently exposes three training directions.
+## Train
 
-### [1] Single primitive
+### Fastest Path
 
-Status: completed for SR (`detail_sr_x4`)
-
-Concrete training script:
-
-- `examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py`
-
-Run scripts:
-```bash
-bash scripts/train_detail_sr_qformer_single_gpu.sh
-```
+Single primitive:
 
 ```bash
-bash scripts/train_detail_sr_qformer_multi_gpu.sh
+bash scripts/train_single_task_primitive_learning.sh
 ```
 
-The scripts expose the main knobs through environment variables such as `OUTPUT_DIR`, `CUDA_VISIBLE_DEVICES`, and `NUM_PROCESSES`.
+Multiple primitives:
 
-Supported pilot modes:
+```bash
+bash scripts/train_multi_task_primitive_learning.sh
+```
 
-- `baseline`: retained FLUX.2 Klein LoRA img2img path
-- `lora_only`: ComPhoser dataset routing without Q-Former conditioning
-- `lora_qformer`: ComPhoser dataset routing with the Q-Former enabled
+### Common Examples
 
-### [2] Multiple primitive
+Single-task `detail` run on one GPU:
 
-Status: TODO
+```bash
+PRIMITIVE_GROUP=detail \
+NUM_PROCESSES=1 \
+CUDA_VISIBLE_DEVICES=0 \
+OUTPUT_DIR=./runs/single_task_detail \
+bash scripts/train_single_task_primitive_learning.sh
+```
 
-### [3] Downstream tasks
+Single-task `tone` run on two GPUs:
 
-Status: TODO
+```bash
+PRIMITIVE_GROUP=tone \
+NUM_PROCESSES=2 \
+CUDA_VISIBLE_DEVICES=0,1 \
+TRAIN_BATCH_SIZE=4 \
+OUTPUT_DIR=./runs/single_task_tone_2gpu \
+bash scripts/train_single_task_primitive_learning.sh
+```
 
-## 5. Inference
+Multi-task run with two groups:
 
-The current supported inference surface is the ComPhoser controlled-validation path, not a separate polished standalone inference CLI.
+```bash
+PRIMITIVE_GROUPS="detail exposure" \
+NUM_PROCESSES=1 \
+CUDA_VISIBLE_DEVICES=0 \
+OUTPUT_DIR=./runs/multi_task_detail_exposure \
+bash scripts/train_multi_task_primitive_learning.sh
+```
 
-For the completed SR primitive, `lora_qformer` final export writes:
+Multi-task run with all four groups:
 
-- `output_dir/comphoser/metadata.json`
-- `output_dir/comphoser/shared_qformer.safetensors`
-- `output_dir/comphoser/task_query_bank.safetensors`
-- `output_dir/comphoser/controlled_validation/summary.json`
-- `output_dir/comphoser/controlled_validation/images/`
+```bash
+PRIMITIVE_GROUPS="detail tone exposure depth" \
+NUM_PROCESSES=2 \
+CUDA_VISIBLE_DEVICES=0,1 \
+TRAIN_BATCH_SIZE=2 \
+OUTPUT_DIR=./runs/multi_task_four_groups_2gpu \
+bash scripts/train_multi_task_primitive_learning.sh
+```
 
-`batch` validation is the default inference-style export for the SR pilot. It runs only the active mode for the current training run:
+### Direct CLI
 
-- `baseline -> flux_only`
-- `lora_only -> lora_only`
-- `lora_qformer -> lora_qformer`
-
-For each selected validation sample it writes:
-
-- `{image_id}_input.png`
-- `{image_id}_output_1.png`, `{image_id}_output_2.png`, ...
-- `{image_id}_gt.png`
-- `{image_id}_all.png`
-
-`--num_validation_images` controls how many validation input samples are processed in ComPhoser batch validation, and `--num_validation_seeds_per_image` controls how many seeded outputs are generated per sample.
-
-Optional single-case validation remains available:
+Use the package CLI when you need full control:
 
 ```bash
 PYTHONPATH=src python -m comphoser.cli.train \
-  --pretrained_model_name_or_path=black-forest-labs/FLUX.2-klein-4B \
-  --output_dir=./runs/detail_sr_single_validation \
+  --pretrained_model_name_or_path black-forest-labs/FLUX.2-klein-4B \
+  --output_dir ./runs/manual_multitask \
   --comphoser_mode lora_qformer \
-  --comphoser_primitive_groups detail \
-  --comphoser_validation_mode single \
-  --validation_prompt "restore fine detail conservatively" \
-  --validation_image ./some_validation_input.png \
-  --num_validation_seeds_per_image 2
+  --comphoser_primitive_groups detail tone exposure depth \
+  --comphoser_data_backend preprocessed \
+  --comphoser_validation_mode batch
 ```
 
-Current limitation:
+### Important Knobs
 
-- multi-primitive composed inference is not implemented yet
+The shell launchers expose these environment variables:
+
+- `PRETRAINED_MODEL_NAME_OR_PATH`
+- `OUTPUT_DIR`
+- `NUM_PROCESSES`
+- `CUDA_VISIBLE_DEVICES`
+- `COMPHOSER_MODE`
+- `COMPHOSER_DATA_BACKEND`
+- `COMPHOSER_VALIDATION_MODE`
+- `COMPHOSER_GATE_LOSS_WEIGHT`
+- `TRAIN_BATCH_SIZE`
+- `LEARNING_RATE`
+- `MAX_TRAIN_STEPS`
+- `VALIDATION_STEPS`
+- `NUM_VALIDATION_IMAGES`
+- `CHECKPOINTING_STEPS`
+- `MIXED_PRECISION`
+- `REPORT_TO`
+
+Defaults:
+
+- single-task launcher: `PRIMITIVE_GROUP=detail`, `NUM_PROCESSES=1`
+- multi-task launcher: `PRIMITIVE_GROUPS="detail tone exposure depth"`, `NUM_PROCESSES=2`
+- both launchers: `COMPHOSER_MODE=lora_qformer`, `COMPHOSER_DATA_BACKEND=preprocessed`, `COMPHOSER_VALIDATION_MODE=batch`
+
+## Check Outputs
+
+Main export location:
+
+```text
+{output_dir}/comphoser/
+```
+
+Common artifacts:
+
+- `metadata.json`
+- `shared_qwp_or_qformer.safetensors`
+- `global_query_bank.safetensors`
+- `controlled_validation/`
+
+Validation behavior:
+
+- `batch`: runs validation-set inference and writes summary artifacts
+- `single`: runs one explicit validation case from `--validation_prompt` and `--validation_image`
+- `off`: disables ComPhoser-owned validation
+
+Typical validation outputs:
+
+- `{image_id}_input.png`
+- `{image_id}_output_1.png`
+- `{image_id}_gt.png`
+- `{image_id}_all.png`
+- `summary.json`
+
+The validation `summary.json` includes per-output, per-sample, and task-level metric aggregates:
+
+- `psnr_db`: RGB PSNR in dB, higher is better
+- `ssim`: mean RGB SSIM, higher is better
+- `delta_e_2000`: mean CIEDE2000 Delta E, lower is better
+- `qformer_gate_accuracy_pct` and `qformer_gate_loss` in `lora_qformer` mode
+
+Mixed runs also write task-local folders such as:
+
+```text
+{output_dir}/comphoser/periodic_validation/{step}/{dataset_id}/
+{output_dir}/comphoser/controlled_validation/{dataset_id}/
+```
+
+## Evaluate A Checkpoint
+
+Use the package evaluator to run an existing ComPhoser primitive checkpoint on a paired validation split and write a report under `runs/reports/...`.
+
+Example depth/bokeh checkpoint evaluation:
+
+```bash
+PYTHONPATH=src python -m comphoser.cli.evaluate_checkpoint \
+  --checkpoint_dir {ckpt_path} \
+  --dataset_root {data_tgt} \
+  --output_dir {output_path} \
+  --num_outputs_per_sample 1 \
+  --num_inference_steps 8 \
+  --seed 17
+```
+
+The same entrypoint is available after install as:
+
+```bash
+comphoser-evaluate-checkpoint \
+  --checkpoint_dir runs/.../checkpoint-100000 \
+  --dataset_root data/depth_bokeh__RealBokeh/val \
+  --output_dir runs/reports/primitive/depth_bokeh_checkpoint_100000
+```
+
+Report layout:
+
+```text
+runs/reports/primitive/{run_name}/
+  summary.md
+  metrics.json
+  controlled_validation/
+    summary.json
+    images/
+```
+
+Dataset root input can be either the dataset root, such as `data/depth_bokeh__RealBokeh`, or a split root, such as `data/depth_bokeh__RealBokeh/val`. By default the evaluator uses all samples; pass `--sample_limit` for a smaller smoke run.
+
+## Repository Map
+
+- `src/comphoser/`: ComPhoser package code
+- `src/comphoser/cli/train.py`: installable training entrypoint
+- `src/comphoser/cli/evaluate_checkpoint.py`: checkpoint evaluation entrypoint
+- `src/comphoser/evaluation.py`: primitive checkpoint evaluation orchestration
+- `src/comphoser/metrics.py`: PSNR, SSIM, and CIEDE2000 metric helpers
+- `scripts/train_single_task_primitive_learning.sh`: single-group launcher
+- `scripts/train_multi_task_primitive_learning.sh`: multi-group launcher
+- `scripts/build_comphoser_raw_dataset.py`: raw dataset builder
+- `scripts/build_comphoser_preprocessed_dataset.py`: latent-cache builder
+- `examples/dreambooth/train_dreambooth_lora_flux2_klein_img2img.py`: retained compatibility shim
+- `docs/`: architecture, dataset contract, and project state
+
+## Current Status
+
+Implemented:
+
+- FLUX.2 Klein LoRA img2img baseline
+- registry-driven dataset routing for `detail`, `tone`, `exposure`, and `depth`
+- mixed training with primitive-group-balanced sampling
+- fixed-bank `lora_qformer` training path
+- controlled validation export with per-task image, metric, and Q-Former gate summaries
+- primitive checkpoint evaluation reports with `summary.md`, `metrics.json`, and controlled-validation artifacts
+
+Not implemented yet:
+
+- arbitrary controller families beyond the fixed four-family catalog
+- multi-family-per-sample composition training
+- broad convergence and quality evaluation campaigns across all four real datasets
+- downstream application-task training on top of primitive composition

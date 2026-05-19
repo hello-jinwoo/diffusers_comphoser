@@ -7,8 +7,8 @@ import os
 from typing import Sequence
 
 from .datasets import COMPHOSER_DATA_BACKENDS
-from .qformer import DEFAULT_QFORMER_QUERY_COUNT
-from .training import PILOT_TRAINING_MODES
+from .qformer import DEFAULT_QFORMER_NUM_LAYERS, DEFAULT_QFORMER_QUERY_COUNT
+from .training import PILOT_GATE_LOSS_WEIGHT_SCHEDULERS, PILOT_TRAINING_MODES
 
 COMPHOSER_VALIDATION_MODES = ("batch", "single", "off")
 
@@ -106,13 +106,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--comphoser_run_mode",
-        dest="comphoser_mode",
-        type=str,
-        choices=PILOT_TRAINING_MODES,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
         "--comphoser_primitive_groups",
         type=str,
         nargs="+",
@@ -144,7 +137,44 @@ def build_parser() -> argparse.ArgumentParser:
         "--comphoser_qformer_num_queries",
         type=int,
         default=DEFAULT_QFORMER_QUERY_COUNT,
-        help="Number of learned Q-Former query tokens to use in 'lora_qformer' mode.",
+        help=(
+            "Number of learned Q-Former query tokens to use in 'lora_qformer' mode. "
+            f"v1 uses a fixed global bank of {DEFAULT_QFORMER_QUERY_COUNT} queries."
+        ),
+    )
+    parser.add_argument(
+        "--comphoser_qformer_num_layers",
+        type=int,
+        default=DEFAULT_QFORMER_NUM_LAYERS,
+        help=(
+            "Number of prompt-routing trunk layers to use in 'lora_qformer' mode. "
+            f"The legacy fixed-bank controller depth is {DEFAULT_QFORMER_NUM_LAYERS}."
+        ),
+    )
+    parser.add_argument(
+        "--comphoser_gate_loss_weight",
+        type=float,
+        default=0.1,
+        help="Legacy fixed auxiliary gate-loss weight source for the fixed-bank Q-Former path.",
+    )
+    parser.add_argument(
+        "--comphoser_gate_loss_weight_initial",
+        type=float,
+        default=None,
+        help="Initial auxiliary gate-loss weight for the fixed-bank Q-Former path.",
+    )
+    parser.add_argument(
+        "--comphoser_gate_loss_weight_final",
+        type=float,
+        default=None,
+        help="Final auxiliary gate-loss weight for the fixed-bank Q-Former path.",
+    )
+    parser.add_argument(
+        "--comphoser_gate_loss_weight_scheduler",
+        type=str,
+        default="linear",
+        choices=PILOT_GATE_LOSS_WEIGHT_SCHEDULERS,
+        help="Scheduler mode for interpolating the auxiliary gate-loss weight across optimizer steps.",
     )
     parser.add_argument("--repeats", type=int, default=1, help="How many times to repeat the training data.")
     parser.add_argument(
@@ -347,7 +377,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="constant",
         help=(
             'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", '
-            '"polynomial", "constant", "constant_with_warmup"]'
+            '"polynomial", "constant", "constant_with_warmup"]. In ComPhoser training entrypoints, '
+            '"constant" applies warmup first when --lr_warmup_steps is positive.'
         ),
     )
     parser.add_argument(
@@ -498,6 +529,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--distributed_timeout_seconds",
+        type=int,
+        default=3600,
+        help=(
+            "Timeout for distributed collectives. Increase this when rank-0-only validation or checkpoint work can "
+            "keep the other ranks waiting for longer than the default process-group timeout."
+        ),
+    )
+    parser.add_argument(
         "--upcast_before_saving",
         action="store_true",
         default=False,
@@ -537,8 +577,30 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     else:
         if not args.comphoser_primitive_groups:
             raise ValueError("ComPhoser pilot modes require --comphoser_primitive_groups")
-        if args.comphoser_mode == "lora_qformer" and args.comphoser_qformer_num_queries <= 0:
-            raise ValueError("--comphoser_qformer_num_queries must be positive in lora_qformer mode")
+        if args.comphoser_mode == "lora_qformer" and args.comphoser_qformer_num_queries != DEFAULT_QFORMER_QUERY_COUNT:
+            raise ValueError(
+                f"--comphoser_qformer_num_queries must stay fixed at {DEFAULT_QFORMER_QUERY_COUNT} in lora_qformer mode"
+            )
+        if args.comphoser_mode == "lora_qformer" and args.comphoser_qformer_num_layers <= 0:
+            raise ValueError("--comphoser_qformer_num_layers must be positive in lora_qformer mode")
+        if args.comphoser_gate_loss_weight < 0.0:
+            raise ValueError("--comphoser_gate_loss_weight must be non-negative")
+        if args.comphoser_gate_loss_weight_initial is None:
+            args.comphoser_gate_loss_weight_initial = float(args.comphoser_gate_loss_weight)
+        if args.comphoser_gate_loss_weight_final is None:
+            args.comphoser_gate_loss_weight_final = float(args.comphoser_gate_loss_weight)
+        if args.comphoser_gate_loss_weight_initial < 0.0:
+            raise ValueError("--comphoser_gate_loss_weight_initial must be non-negative")
+        if args.comphoser_gate_loss_weight_final < 0.0:
+            raise ValueError("--comphoser_gate_loss_weight_final must be non-negative")
+        if args.comphoser_gate_loss_weight_scheduler == "logarithmic" and (
+            args.comphoser_gate_loss_weight_initial <= 0.0 or args.comphoser_gate_loss_weight_final <= 0.0
+        ):
+            raise ValueError(
+                "--comphoser_gate_loss_weight_scheduler=logarithmic requires positive "
+                "--comphoser_gate_loss_weight_initial and --comphoser_gate_loss_weight_final"
+            )
+        args.comphoser_gate_loss_weight = float(args.comphoser_gate_loss_weight_initial)
         if args.num_validation_seeds_per_image <= 0:
             raise ValueError("--num_validation_seeds_per_image must be positive")
         if args.comphoser_validation_mode == "batch" and args.num_validation_images <= 0:
@@ -554,6 +616,9 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
+
+    if args.distributed_timeout_seconds <= 0:
+        raise ValueError("--distributed_timeout_seconds must be positive")
 
     return args
 

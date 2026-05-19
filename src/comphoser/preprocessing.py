@@ -15,6 +15,8 @@ from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline
 
 ORIGINAL_INPUT_DIR = ("original", "images", "input")
 ORIGINAL_TARGET_DIR = ("original", "images", "target")
+LEGACY_ORIGINAL_INPUT_DIR = ("original", "input")
+LEGACY_ORIGINAL_TARGET_DIR = ("original", "target")
 ORIGINAL_PROMPT_DIR = ("original", "prompt")
 RAW_INPUT_DIR = ("raw", "images", "input")
 RAW_TARGET_DIR = ("raw", "images", "target")
@@ -24,7 +26,7 @@ PREPROCESSED_IMAGE_CACHE_TARGET_DIR = ("preprocessed", "image_latent_cache", "ta
 PREPROCESSED_PROMPT_CACHE_DIR = ("preprocessed", "prompt_latent_cache")
 SUPPORTED_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 ExistingArtifactPolicy = Literal["error", "skip", "overwrite"]
-OriginalPairingMode = Literal["by_name", "sorted"]
+OriginalPairingMode = Literal["by_name", "sorted", "order"]
 
 
 @dataclass(frozen=True)
@@ -163,16 +165,25 @@ def discover_original_paired_samples(
     dataset_root = resolve_dataset_root(dataset_root)
     if sample_limit is not None and sample_limit <= 0:
         raise ValueError("sample_limit must be positive when provided")
-    if pairing_mode not in {"by_name", "sorted"}:
+    if pairing_mode not in {"by_name", "sorted", "order"}:
         raise ValueError(f"Unsupported pairing_mode: {pairing_mode}")
 
-    input_root = dataset_root / Path(*ORIGINAL_INPUT_DIR)
-    target_root = dataset_root / Path(*ORIGINAL_TARGET_DIR)
-    prompt_root = dataset_root / Path(*ORIGINAL_PROMPT_DIR)
+    if pairing_mode == "order":
+        pairing_mode = "sorted"
 
-    for root in (input_root, target_root):
-        if not root.is_dir():
-            raise FileNotFoundError(f"Required original dataset directory not found: {root}")
+    input_root = _resolve_original_image_directory(
+        dataset_root,
+        primary_parts=ORIGINAL_INPUT_DIR,
+        legacy_parts=LEGACY_ORIGINAL_INPUT_DIR,
+        label="input",
+    )
+    target_root = _resolve_original_image_directory(
+        dataset_root,
+        primary_parts=ORIGINAL_TARGET_DIR,
+        legacy_parts=LEGACY_ORIGINAL_TARGET_DIR,
+        label="target",
+    )
+    prompt_root = dataset_root / Path(*ORIGINAL_PROMPT_DIR)
 
     prompt_paths: tuple[Path, ...] | None = None
     if include_original_prompts:
@@ -743,6 +754,27 @@ def _collect_named_files(
             raise ValueError(f"Duplicate files detected for sample id '{sample_id}' in {directory}")
         files_by_id[sample_id] = path
     return files_by_id
+
+
+def _resolve_original_image_directory(
+    dataset_root: Path,
+    *,
+    primary_parts: Sequence[str],
+    legacy_parts: Sequence[str],
+    label: str,
+) -> Path:
+    primary_root = dataset_root / Path(*primary_parts)
+    if primary_root.is_dir():
+        return primary_root
+
+    legacy_root = dataset_root / Path(*legacy_parts)
+    if legacy_root.is_dir():
+        return legacy_root
+
+    raise FileNotFoundError(
+        "Required original "
+        f"{label} directory not found. Checked '{primary_root}' and legacy fallback '{legacy_root}'."
+    )
 
 
 def _collect_source_files(

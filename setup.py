@@ -295,6 +295,7 @@ setup(
     entry_points={
         "console_scripts": [
             "diffusers-cli=diffusers.commands.diffusers_cli:main",
+            "comphoser-evaluate-checkpoint=comphoser.cli.evaluate_checkpoint:main",
             "comphoser-train=comphoser.cli.train:main",
         ]
     },

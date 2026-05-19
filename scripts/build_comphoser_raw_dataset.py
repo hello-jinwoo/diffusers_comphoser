@@ -29,7 +29,7 @@ _PREPROCESSING = _load_local_preprocessing_module()
 build_raw_images_from_original = _PREPROCESSING.build_raw_images_from_original
 
 
-PAIRING_MODE_CHOICES = ("by_name", "sorted")
+PAIRING_MODE_CHOICES = ("by_name", "sorted", "order")
 IF_EXISTS_CHOICES = ("error", "skip", "overwrite")
 
 

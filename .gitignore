@@ -183,16 +183,10 @@ tags
 # wandb
 wandb
 
-# AI agent and Codex artifacts
+# AI agent artifacts (kept local-only by project convention)
 .ai/
-.codex/
-.agents/
 .claude/
-# Explicit task artifact cache under Codex
-.codex/tasks/*
 /docs/
-/.codex/
-/.agents/
 **/AGENTS.md
 **/CLAUDE.md
 

@@ -1,25 +1,38 @@
-"""Lightweight Q-Former controller for the single-task ComPhoser pilot."""
+"""Fixed-bank prompt-routed controller for the v1 ComPhoser multi-primitive path."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping, Sequence
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
 
-from .controls import DEFAULT_PRIMITIVE_TASK_ID
+from .controls import (
+    DEFAULT_PRIMITIVE_TASK_ID,
+    PILOT_PRIMITIVE_FAMILY_ORDER,
+    PILOT_QUERIES_PER_PRIMITIVE,
+    PILOT_TOTAL_QUERY_COUNT,
+    ResolvedPrimitiveSelection,
+    resolve_control_selection,
+    resolve_primitive_group,
+)
 
 DEFAULT_QFORMER_TASK_ID = DEFAULT_PRIMITIVE_TASK_ID
-DEFAULT_QFORMER_QUERY_COUNT = 8
+DEFAULT_QFORMER_QUERY_COUNT = PILOT_TOTAL_QUERY_COUNT
 DEFAULT_QFORMER_COND_SUMMARY_TOKENS = 4
+DEFAULT_QFORMER_NUM_LAYERS = 3
+QFORMER_CONTROLLER_LAYOUT_PROMPT_ROUTER_V2 = "fixed_global_query_bank_prompt_router_v2"
+QFORMER_RUNTIME_GATE_MODE_PREDICTED_ONLY = "predicted_only"
+QFORMER_RUNTIME_GATE_MODE_TARGET_MASKED = "target_masked"
 
 
 @dataclass(frozen=True)
 class ComPhoserQFormerOutput:
     query_group: Tensor
-    task_strength: Tensor
+    gate_targets: Tensor
     raw_query_gates: Tensor
+    predicted_query_gates: Tensor
     query_gates: Tensor
     gate_summary: dict[str, Tensor]
 
@@ -32,7 +45,7 @@ class AugmentedConditioning:
 
 
 class ComPhoserQFormer(nn.Module):
-    """Single-task pilot controller that gates learned queries from prompt and image context."""
+    """Prompt-only QWP-Net over one fixed global query bank."""
 
     def __init__(
         self,
@@ -41,46 +54,40 @@ class ComPhoserQFormer(nn.Module):
         cond_token_dim: int | None = None,
         num_queries: int = DEFAULT_QFORMER_QUERY_COUNT,
         cond_summary_tokens: int = DEFAULT_QFORMER_COND_SUMMARY_TOKENS,
-        num_heads: int = 4,
+        num_layers: int = DEFAULT_QFORMER_NUM_LAYERS,
+        num_heads: int = 16,
         ffn_multiplier: int = 4,
     ) -> None:
         super().__init__()
 
         if hidden_size <= 0:
             raise ValueError("hidden_size must be positive")
-        if num_queries <= 0:
-            raise ValueError("num_queries must be positive")
+        if num_queries != DEFAULT_QFORMER_QUERY_COUNT:
+            raise ValueError(
+                f"ComPhoserQFormer uses a fixed global query bank of {DEFAULT_QFORMER_QUERY_COUNT} tokens, "
+                f"received {num_queries}"
+            )
         if cond_summary_tokens <= 0:
             raise ValueError("cond_summary_tokens must be positive")
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
         if num_heads <= 0 or hidden_size % num_heads != 0:
             raise ValueError("num_heads must divide hidden_size")
 
         self.hidden_size = hidden_size
         self.num_queries = num_queries
+        self.queries_per_primitive = PILOT_QUERIES_PER_PRIMITIVE
         self.cond_summary_tokens = cond_summary_tokens
         self.cond_token_dim = hidden_size if cond_token_dim is None else cond_token_dim
+        self.num_layers = num_layers
         self.num_heads = num_heads
         self.ffn_multiplier = ffn_multiplier
 
-        if self.cond_token_dim == hidden_size:
-            self.cond_projection: nn.Module = nn.Identity()
-        else:
-            self.cond_projection = nn.Linear(self.cond_token_dim, hidden_size)
-
         self.prompt_norm = nn.LayerNorm(hidden_size)
-        self.cond_norm = nn.LayerNorm(hidden_size)
         self.query_norm = nn.LayerNorm(hidden_size)
-        self.task_embedding = nn.Embedding(1, hidden_size)
         self.query_bank = nn.Parameter(torch.empty(num_queries, hidden_size))
-        self.shared_trunk = nn.TransformerEncoderLayer(
-            d_model=hidden_size,
-            nhead=num_heads,
-            dim_feedforward=max(hidden_size * ffn_multiplier, hidden_size),
-            dropout=0.0,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
+        self.shared_trunk = self._build_trunk_layer()
+        self.extra_trunk_layers = nn.ModuleList(self._build_trunk_layer() for _ in range(num_layers - 1))
         self.query_attention = nn.MultiheadAttention(
             embed_dim=hidden_size,
             num_heads=num_heads,
@@ -93,93 +100,134 @@ class ComPhoserQFormer(nn.Module):
         )
         self.reset_parameters()
 
+    def _build_trunk_layer(self) -> nn.TransformerEncoderLayer:
+        return nn.TransformerEncoderLayer(
+            d_model=self.hidden_size,
+            nhead=self.num_heads,
+            dim_feedforward=max(self.hidden_size * self.ffn_multiplier, self.hidden_size),
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+
     def reset_parameters(self) -> None:
         nn.init.normal_(self.query_bank, mean=0.0, std=0.02)
-        nn.init.normal_(self.task_embedding.weight, mean=0.0, std=0.02)
 
     def forward(
         self,
         prompt_embeds: Tensor,
-        cond_tokens: Tensor,
+        cond_tokens: Tensor | None = None,
         *,
-        task_ids: str | tuple[str, ...] | list[str] | None = None,
-        task_strengths: Tensor | float | tuple[float, ...] | list[float] | None = None,
+        primitive_groups: (
+            Sequence[Sequence[str] | str]
+            | Sequence[str]
+            | str
+            | None
+        ) = None,
+        primitive_strengths: (
+            Sequence[Sequence[float] | float]
+            | Sequence[float]
+            | Mapping[str, float]
+            | Tensor
+            | float
+            | None
+        ) = None,
+        explicit_token_masking: Sequence[float] | Tensor | None = None,
     ) -> ComPhoserQFormerOutput:
         if prompt_embeds.ndim != 3:
             raise ValueError("prompt_embeds must have shape [batch, seq_len, hidden_size]")
-        if cond_tokens.ndim != 3:
-            raise ValueError("cond_tokens must have shape [batch, seq_len, cond_hidden_size]")
-        if prompt_embeds.shape[0] != cond_tokens.shape[0]:
-            raise ValueError("prompt_embeds and cond_tokens must share the same batch size")
         if prompt_embeds.shape[-1] != self.hidden_size:
             raise ValueError(
                 f"prompt_embeds hidden size must match controller hidden_size={self.hidden_size}, "
                 f"received {prompt_embeds.shape[-1]}"
             )
-        if cond_tokens.shape[-1] != self.cond_token_dim:
-            raise ValueError(
-                f"cond_tokens hidden size must match controller cond_token_dim={self.cond_token_dim}, "
-                f"received {cond_tokens.shape[-1]}"
-            )
 
         batch_size = prompt_embeds.shape[0]
-        normalized_task_ids = _normalize_task_ids(task_ids, batch_size=batch_size)
-        if normalized_task_ids and any(task_id != DEFAULT_QFORMER_TASK_ID for task_id in normalized_task_ids):
-            unsupported = ", ".join(sorted(set(normalized_task_ids)))
-            raise NotImplementedError(
-                f"ComPhoserQFormer only supports '{DEFAULT_QFORMER_TASK_ID}', received: {unsupported}"
-            )
+        if cond_tokens is not None:
+            if cond_tokens.ndim != 3:
+                raise ValueError("cond_tokens must have shape [batch, seq_len, cond_hidden_size]")
+            if cond_tokens.shape[0] != batch_size:
+                raise ValueError("prompt_embeds and cond_tokens must share the same batch size")
+            if cond_tokens.shape[-1] != self.cond_token_dim:
+                raise ValueError(
+                    f"cond_tokens hidden size must match controller cond_token_dim={self.cond_token_dim}, "
+                    f"received {cond_tokens.shape[-1]}"
+                )
 
-        task_strength = _coerce_task_strengths(
-            task_strengths,
+        gate_targets = build_batch_query_gate_target_mask(
+            primitive_groups,
+            primitive_strengths,
             batch_size=batch_size,
             device=prompt_embeds.device,
             dtype=prompt_embeds.dtype,
-            default_value=0.0 if not normalized_task_ids else 1.0,
         )
 
-        prompt_context = self.prompt_norm(prompt_embeds)
-        cond_context = self.cond_norm(self._summarize_condition_tokens(cond_tokens))
-        task_context = self.task_embedding(
-            torch.zeros(batch_size, dtype=torch.long, device=prompt_embeds.device)
-        ).unsqueeze(1)
-        joint_context = torch.cat((prompt_context, cond_context, task_context), dim=1)
-        joint_context = self.shared_trunk(joint_context)
-
+        prompt_context = self.shared_trunk(self.prompt_norm(prompt_embeds))
+        for layer in self.extra_trunk_layers:
+            prompt_context = layer(prompt_context)
         query_bank = self.query_bank.unsqueeze(0).expand(batch_size, -1, -1)
-        attended_context, _ = self.query_attention(query_bank, joint_context, joint_context, need_weights=False)
+        attended_context, _ = self.query_attention(query_bank, prompt_context, prompt_context, need_weights=False)
         raw_query_gates = self.gate_head(attended_context + query_bank).squeeze(-1)
 
-        base_query_gates = torch.sigmoid(raw_query_gates)
-        query_gates = base_query_gates * task_strength.unsqueeze(-1)
+        predicted_query_gates = torch.sigmoid(raw_query_gates)
+        normalized_override = _normalize_explicit_token_masking(
+            explicit_token_masking,
+            batch_size=batch_size,
+            device=predicted_query_gates.device,
+            dtype=predicted_query_gates.dtype,
+        )
+        query_gates = predicted_query_gates if normalized_override is None else normalized_override
         query_group = self.query_norm(query_bank) * query_gates.unsqueeze(-1)
 
-        gate_summary = {
-            "raw_mean": raw_query_gates.mean(dim=1),
-            "raw_std": raw_query_gates.std(dim=1, unbiased=False),
-            "active_mean": query_gates.mean(dim=1),
-            "active_min": query_gates.min(dim=1).values,
-            "active_max": query_gates.max(dim=1).values,
-        }
         return ComPhoserQFormerOutput(
             query_group=query_group,
-            task_strength=task_strength,
+            gate_targets=gate_targets,
             raw_query_gates=raw_query_gates,
+            predicted_query_gates=predicted_query_gates,
             query_gates=query_gates,
-            gate_summary=gate_summary,
+            gate_summary=_build_gate_summary(
+                raw_query_gates,
+                predicted_query_gates,
+                query_gates,
+                gate_targets,
+                explicit_token_masking=normalized_override,
+            ),
         )
 
-    def _summarize_condition_tokens(self, cond_tokens: Tensor) -> Tensor:
-        cond_hidden_states = self.cond_projection(cond_tokens)
-        if cond_hidden_states.shape[1] == 0:
-            return cond_hidden_states.new_zeros(cond_hidden_states.shape[0], 1, self.hidden_size)
-        if cond_hidden_states.shape[1] <= self.cond_summary_tokens:
-            return cond_hidden_states
 
-        return F.adaptive_avg_pool1d(
-            cond_hidden_states.transpose(1, 2),
-            output_size=self.cond_summary_tokens,
-        ).transpose(1, 2)
+def build_query_gate_target_mask(
+    primitive_groups: Sequence[str] | str | None = None,
+    primitive_strengths: Mapping[str, float] | Sequence[float] | float | None = None,
+    *,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> Tensor:
+    selection = resolve_control_selection(primitive_groups=primitive_groups, task_strengths=primitive_strengths)
+    return _selection_to_gate_mask(selection, device=device, dtype=dtype)
+
+
+def build_batch_query_gate_target_mask(
+    primitive_groups: Sequence[Sequence[str] | str] | Sequence[str] | str | None,
+    primitive_strengths: Sequence[Sequence[float] | float] | Sequence[float] | Mapping[str, float] | Tensor | float | None,
+    *,
+    batch_size: int,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> Tensor:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    resolved_dtype = dtype or torch.float32
+    selections = _resolve_batch_control_selections(
+        primitive_groups,
+        primitive_strengths,
+        batch_size=batch_size,
+    )
+    return torch.stack(
+        [_selection_to_gate_mask(selection, device=device, dtype=resolved_dtype) for selection in selections],
+        dim=0,
+    )
 
 
 def build_synthetic_txt_ids(base_txt_ids: Tensor, added_token_count: int) -> Tensor:
@@ -234,6 +282,178 @@ def append_query_tokens_to_prompt(
     )
 
 
+def _selection_to_gate_mask(
+    selection: ResolvedPrimitiveSelection,
+    *,
+    device: torch.device | None,
+    dtype: torch.dtype | None,
+) -> Tensor:
+    mask = torch.zeros(PILOT_TOTAL_QUERY_COUNT, device=device, dtype=dtype or torch.float32)
+    for primitive_group, strength in zip(selection.primitive_groups, selection.primitive_strengths):
+        family = resolve_primitive_group(primitive_group)
+        mask[family.query_slot_start : family.query_slot_stop] = float(strength)
+    return mask
+
+
+def _resolve_batch_control_selections(
+    primitive_groups: Sequence[Sequence[str] | str] | Sequence[str] | str | None,
+    primitive_strengths: Sequence[Sequence[float] | float] | Sequence[float] | Mapping[str, float] | Tensor | float | None,
+    *,
+    batch_size: int,
+) -> tuple[ResolvedPrimitiveSelection, ...]:
+    if primitive_groups is None or isinstance(primitive_groups, str) or _is_flat_string_sequence(primitive_groups):
+        selection = resolve_control_selection(
+            primitive_groups=primitive_groups,
+            task_strengths=_normalize_empty_strength_spec(primitive_strengths),
+        )
+        return (selection,) * batch_size
+
+    normalized_group_batches = tuple(primitive_groups)
+    if len(normalized_group_batches) != batch_size:
+        raise ValueError(
+            f"Expected batched primitive_groups to have length {batch_size}, "
+            f"received {len(normalized_group_batches)}"
+        )
+
+    if primitive_strengths is None:
+        strength_batches: tuple[object, ...] = (None,) * batch_size
+    else:
+        if isinstance(primitive_strengths, Tensor):
+            if primitive_strengths.ndim == 0:
+                strength_batches = (float(primitive_strengths.item()),) * batch_size
+            elif primitive_strengths.ndim == 1 and primitive_strengths.shape[0] == batch_size:
+                strength_batches = tuple(float(value) for value in primitive_strengths.tolist())
+            else:
+                raise ValueError(
+                    "Tensor primitive_strengths must be scalar or have shape [batch_size] when using batched groups"
+                )
+        else:
+            strength_batches = tuple(primitive_strengths)
+            if len(strength_batches) != batch_size:
+                raise ValueError(
+                    f"Expected batched primitive_strengths to have length {batch_size}, "
+                    f"received {len(strength_batches)}"
+                )
+
+    selections: list[ResolvedPrimitiveSelection] = []
+    for sample_groups, sample_strengths in zip(normalized_group_batches, strength_batches):
+        selections.append(
+            resolve_control_selection(
+                primitive_groups=sample_groups,
+                task_strengths=_normalize_empty_strength_spec(sample_strengths),
+            )
+        )
+    return tuple(selections)
+
+
+def _build_gate_summary(
+    raw_query_gates: Tensor,
+    predicted_query_gates: Tensor,
+    query_gates: Tensor,
+    gate_targets: Tensor,
+    *,
+    explicit_token_masking: Tensor | None,
+) -> dict[str, Tensor]:
+    family_shape = (-1, len(PILOT_PRIMITIVE_FAMILY_ORDER), PILOT_QUERIES_PER_PRIMITIVE)
+    raw_family = raw_query_gates.reshape(family_shape)
+    predicted_family = predicted_query_gates.reshape(family_shape)
+    active_family = query_gates.reshape(family_shape)
+    target_family = gate_targets.reshape(family_shape)
+    summary = {
+        "raw_mean": raw_query_gates.mean(dim=1),
+        "raw_std": raw_query_gates.std(dim=1, unbiased=False),
+        "predicted_mean": predicted_query_gates.mean(dim=1),
+        "predicted_min": predicted_query_gates.min(dim=1).values,
+        "predicted_max": predicted_query_gates.max(dim=1).values,
+        "active_mean": query_gates.mean(dim=1),
+        "active_min": query_gates.min(dim=1).values,
+        "active_max": query_gates.max(dim=1).values,
+        "effective_mean": query_gates.mean(dim=1),
+        "effective_min": query_gates.min(dim=1).values,
+        "effective_max": query_gates.max(dim=1).values,
+        "target_mean": gate_targets.mean(dim=1),
+        "family_raw_mean": raw_family.mean(dim=2),
+        "family_predicted_mean": predicted_family.mean(dim=2),
+        "family_active_mean": active_family.mean(dim=2),
+        "family_effective_mean": active_family.mean(dim=2),
+        "family_target_mean": target_family.mean(dim=2),
+        "explicit_token_masking_applied": torch.full(
+            (raw_query_gates.shape[0],),
+            explicit_token_masking is not None,
+            device=raw_query_gates.device,
+            dtype=torch.bool,
+        ),
+    }
+    if explicit_token_masking is not None:
+        summary["explicit_token_masking"] = explicit_token_masking
+    return summary
+
+
+def _normalize_explicit_token_masking(
+    explicit_token_masking: Sequence[float] | Tensor | None,
+    *,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor | None:
+    if explicit_token_masking is None:
+        return None
+
+    if isinstance(explicit_token_masking, Tensor):
+        mask = explicit_token_masking.to(device=device, dtype=dtype)
+    else:
+        mask = torch.as_tensor(tuple(float(value) for value in explicit_token_masking), device=device, dtype=dtype)
+
+    if mask.ndim == 1:
+        if mask.shape[0] != PILOT_TOTAL_QUERY_COUNT:
+            raise ValueError(
+                f"explicit_token_masking must contain exactly {PILOT_TOTAL_QUERY_COUNT} values, "
+                f"received {mask.shape[0]}"
+            )
+        mask = mask.unsqueeze(0).expand(batch_size, -1)
+    elif mask.ndim == 2:
+        if mask.shape != (batch_size, PILOT_TOTAL_QUERY_COUNT):
+            raise ValueError(
+                f"explicit_token_masking must have shape [{PILOT_TOTAL_QUERY_COUNT}] or "
+                f"[batch, {PILOT_TOTAL_QUERY_COUNT}], received {tuple(mask.shape)}"
+            )
+    else:
+        raise ValueError(
+            f"explicit_token_masking must have shape [{PILOT_TOTAL_QUERY_COUNT}] or "
+            f"[batch, {PILOT_TOTAL_QUERY_COUNT}], received {tuple(mask.shape)}"
+        )
+
+    if not torch.isfinite(mask).all():
+        raise ValueError("explicit_token_masking values must be finite")
+    if torch.any((mask < 0.0) | (mask > 1.0)):
+        raise ValueError("explicit_token_masking values must stay within [0.0, 1.0]")
+    return mask
+
+
+def _is_flat_string_sequence(value: object) -> bool:
+    if isinstance(value, str):
+        return False
+    if not isinstance(value, Sequence):
+        return False
+    return all(isinstance(item, str) for item in value)
+
+
+def _normalize_empty_strength_spec(value: object) -> object | None:
+    if value is None:
+        return None
+    if isinstance(value, Tensor):
+        if value.ndim == 1 and value.shape[0] == 0:
+            return None
+        return value
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Sequence) and len(value) == 0:
+        return None
+    return value
+
+
 def _build_synthetic_txt_ids_2d(base_txt_ids: Tensor, added_token_count: int) -> Tensor:
     if added_token_count == 0:
         return base_txt_ids.new_empty((0, 4))
@@ -269,76 +489,19 @@ def _build_synthetic_txt_ids_3d(base_txt_ids: Tensor, added_token_count: int) ->
     return synthetic_txt_ids
 
 
-def _normalize_task_ids(
-    task_ids: str | tuple[str, ...] | list[str] | None,
-    *,
-    batch_size: int,
-) -> tuple[str, ...]:
-    if task_ids is None:
-        return (DEFAULT_QFORMER_TASK_ID,) * batch_size
-    if isinstance(task_ids, str):
-        return (task_ids,) * batch_size
-
-    normalized_task_ids = tuple(task_ids)
-    if not normalized_task_ids:
-        return ()
-    if len(normalized_task_ids) == 1:
-        return normalized_task_ids * batch_size
-    if len(normalized_task_ids) != batch_size:
-        raise ValueError(
-            f"Expected task_ids to have length 1 or batch size {batch_size}, received {len(normalized_task_ids)}"
-        )
-    return normalized_task_ids
-
-
-def _coerce_task_strengths(
-    task_strengths: Tensor | float | tuple[float, ...] | list[float] | None,
-    *,
-    batch_size: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    default_value: float,
-) -> Tensor:
-    if task_strengths is None:
-        return torch.full((batch_size,), default_value, device=device, dtype=dtype)
-
-    if isinstance(task_strengths, Tensor):
-        strengths = task_strengths.to(device=device, dtype=dtype)
-        if strengths.ndim == 0:
-            strengths = strengths.expand(batch_size)
-        elif strengths.ndim == 1 and strengths.shape[0] == 1:
-            strengths = strengths.expand(batch_size)
-        elif strengths.ndim == 1 and strengths.shape[0] == 0:
-            strengths = torch.zeros(batch_size, device=device, dtype=dtype)
-        elif strengths.ndim != 1 or strengths.shape[0] != batch_size:
-            raise ValueError(
-                f"Expected task_strengths tensor to have shape [] or [{batch_size}], received {tuple(strengths.shape)}"
-            )
-    elif isinstance(task_strengths, (int, float)):
-        strengths = torch.full((batch_size,), float(task_strengths), device=device, dtype=dtype)
-    else:
-        strengths = torch.tensor(tuple(float(value) for value in task_strengths), device=device, dtype=dtype)
-        if strengths.shape[0] == 0:
-            strengths = torch.zeros(batch_size, device=device, dtype=dtype)
-        elif strengths.shape[0] == 1:
-            strengths = strengths.expand(batch_size)
-        elif strengths.shape[0] != batch_size:
-            raise ValueError(
-                f"Expected task_strengths to have length 1 or batch size {batch_size}, received {strengths.shape[0]}"
-            )
-
-    if torch.any(strengths < 0.0) or torch.any(strengths > 1.0):
-        raise ValueError("task_strengths must stay within [0.0, 1.0]")
-    return strengths
-
-
 __all__ = [
     "AugmentedConditioning",
     "ComPhoserQFormer",
     "ComPhoserQFormerOutput",
     "DEFAULT_QFORMER_COND_SUMMARY_TOKENS",
+    "DEFAULT_QFORMER_NUM_LAYERS",
     "DEFAULT_QFORMER_QUERY_COUNT",
     "DEFAULT_QFORMER_TASK_ID",
+    "QFORMER_CONTROLLER_LAYOUT_PROMPT_ROUTER_V2",
+    "QFORMER_RUNTIME_GATE_MODE_PREDICTED_ONLY",
+    "QFORMER_RUNTIME_GATE_MODE_TARGET_MASKED",
     "append_query_tokens_to_prompt",
+    "build_batch_query_gate_target_mask",
+    "build_query_gate_target_mask",
     "build_synthetic_txt_ids",
 ]
