@@ -13,7 +13,7 @@ from .controls import (
     PrimitiveTaskSpec,
     get_task_spec,
     get_task_spec_for_dataset_id,
-    get_task_spec_for_primitive_group,
+    get_task_specs_for_primitive_group,
     normalize_primitive_groups,
 )
 from .datasets import load_prepared_pilot_records
@@ -185,9 +185,16 @@ def resolve_evaluation_dataset(
     if task_id is not None:
         task = get_task_spec(task_id)
     elif primitive_group is not None:
-        task = get_task_spec_for_primitive_group(primitive_group)
-        if task is None:
+        group_tasks = get_task_specs_for_primitive_group(primitive_group)
+        if not group_tasks:
             raise ValueError(f"No dataset-backed task is registered for primitive group '{primitive_group}'")
+        if len(group_tasks) > 1:
+            options = ", ".join(spec.dataset_id for spec in group_tasks)
+            raise ValueError(
+                f"Primitive group '{primitive_group}' has multiple registered datasets ({options}); "
+                "disambiguate with --task_id or --dataset_root."
+            )
+        task = group_tasks[0]
     else:
         task = get_task_spec_for_dataset_id(resolved_dataset_root.name)
 
@@ -264,7 +271,25 @@ def load_evaluation_pipeline(
     if load_lora_weights:
         if checkpoint_dir is None:
             raise ValueError("checkpoint_dir is required when load_lora_weights=True")
-        pipeline.load_lora_weights(str(checkpoint_dir))
+        checkpoint_path = Path(checkpoint_dir)
+        downstream_lora_path = checkpoint_path / "pytorch_lora_weights_downstream.safetensors"
+        if downstream_lora_path.is_file():
+            # Stage 3 checkpoint: both the frozen Stage 1+2 LoRA ("default") and the
+            # additional downstream LoRA ("downstream") are present. Load both adapters
+            # and activate them additively at inference.
+            pipeline.load_lora_weights(
+                str(checkpoint_path),
+                weight_name="pytorch_lora_weights.safetensors",
+                adapter_name="default",
+            )
+            pipeline.load_lora_weights(
+                str(checkpoint_path),
+                weight_name="pytorch_lora_weights_downstream.safetensors",
+                adapter_name="downstream",
+            )
+            pipeline.set_adapters(["default", "downstream"], adapter_weights=[1.0, 1.0])
+        else:
+            pipeline.load_lora_weights(str(checkpoint_path))
     if enable_model_cpu_offload and device.type == "cuda":
         pipeline.enable_model_cpu_offload()
     else:

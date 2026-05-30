@@ -73,11 +73,15 @@ from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 import diffusers
 from comphoser.datasets import (
     BucketBatchSampler,
+    IdentityWrapper,
     MultiPreparedPilotDataset,
     PreparedPilotDataset,
     PrimitiveGroupBalancedBucketBatchSampler,
+    UniformFolderSampler,
     collate_prepared_pilot_examples,
 )
+
+STAGE1_PRESERVE_PROMPT = "keep the image unchanged."
 from comphoser.image_utils import ensure_rgb_image, load_rgb_image, paired_image_transform
 from comphoser.train_args import parse_args
 from comphoser.train_runtime import (
@@ -88,7 +92,6 @@ from comphoser.train_runtime import (
     build_pilot_qformer,
     build_unified_qformer_validation_summary,
     resolve_and_log_pilot_training,
-    resolve_comphoser_validation_contact_sheet_path,
     run_comphoser_validation,
     run_final_comphoser_export,
     save_unified_qformer_validation_distribution,
@@ -102,7 +105,9 @@ from comphoser.training import (
     resolve_pilot_batch_primitive_controls,
     resolve_pilot_gate_loss_weight,
     resolve_training_lr_scheduler_name,
+    resolve_validation_enable_model_cpu_offload,
     save_pilot_qformer_checkpoint,
+    should_skip_gate_loss,
 )
 from diffusers import (
     AutoencoderKLFlux2,
@@ -242,7 +247,13 @@ def log_validation(
         f" {prompt_label}."
     )
     pipeline = pipeline.to(dtype=torch_dtype)
-    pipeline.enable_model_cpu_offload()
+    if resolve_validation_enable_model_cpu_offload(
+        getattr(args, "validation_model_cpu_offload", "auto"),
+        accelerator.device,
+    ):
+        pipeline.enable_model_cpu_offload()
+    else:
+        pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
     # run inference
@@ -280,17 +291,16 @@ def log_validation(
     return images
 
 def _log_comphoser_validation_results(accelerator, validation_results, *, step):
+    # Per-task contact sheets are written to disk by save_controlled_validation_artifacts
+    # but are NOT uploaded to wandb (too noisy for the dashboard). The unified Q-Former
+    # gate-distribution PNG is both saved locally and uploaded to wandb so routing
+    # behavior is visible at a glance.
     if not validation_results:
         return
 
     scalar_payload = {}
-    wandb_media_paths = []
-    for summary_path, summary in validation_results:
+    for _summary_path, summary in validation_results:
         scalar_payload.update(build_comphoser_validation_tracker_payload(summary))
-        contact_sheet_path = resolve_comphoser_validation_contact_sheet_path(summary_path, summary)
-        if contact_sheet_path is None or not contact_sheet_path.is_file():
-            continue
-        wandb_media_paths.append((str(summary["task_id"]), contact_sheet_path))
 
     unified_qformer_summary = build_unified_qformer_validation_summary(validation_results)
     average_accuracy_pct = unified_qformer_summary.get("average_accuracy_pct")
@@ -305,25 +315,20 @@ def _log_comphoser_validation_results(accelerator, validation_results, *, step):
 
     distribution_path = save_unified_qformer_validation_distribution(validation_results, unified_qformer_summary)
 
-    if (not wandb_media_paths and distribution_path is None) or not is_wandb_available():
+    if distribution_path is None or not distribution_path.is_file() or not is_wandb_available():
         return
     for tracker in accelerator.trackers:
         if tracker.name != "wandb":
             continue
-        tracker_payload = {
-            f"validation/{task_id}/contact_sheet": wandb.Image(
-                str(contact_sheet_path),
-                caption=f"{task_id} validation contact sheet",
-            )
-            for task_id, contact_sheet_path in wandb_media_paths
-        }
-        if distribution_path is not None and distribution_path.is_file():
-            tracker_payload["validation/qformer_gate_distribution"] = wandb.Image(
-                str(distribution_path),
-                caption="Unified validation Q-Former gate distribution",
-            )
-        if tracker_payload:
-            tracker.log(tracker_payload)
+        tracker.log(
+            {
+                "validation/qformer_gate_distribution": wandb.Image(
+                    str(distribution_path),
+                    caption="Unified validation Q-Former gate distribution",
+                ),
+            },
+            step=step,
+        )
 
 
 def module_filter_fn(mod: torch.nn.Module, fqn: str):
@@ -798,12 +803,31 @@ def main(args):
         init_lora_weights="gaussian",
         target_modules=target_modules,
     )
-    transformer.add_adapter(transformer_lora_config)
+    # Stage 3 (step_by_step_stage3) trains a NEW LoRA adapter ("downstream") on top of the
+    # frozen Stage 1+2 LoRA ("default") + frozen Q-Former. Both adapters are attached up
+    # front so the optimizer (built below) sees the trainable set correctly; the freeze of
+    # "default" + Q-Former happens right after this block.
+    is_stage3 = getattr(args, "training_strategy", None) == "step_by_step_stage3"
+    if is_stage3:
+        transformer.add_adapter(transformer_lora_config, adapter_name="default")
+        transformer.add_adapter(transformer_lora_config, adapter_name="downstream")
+        transformer.set_adapters(["default", "downstream"], weights=[1.0, 1.0])
+    else:
+        transformer.add_adapter(transformer_lora_config)
     qformer = build_pilot_qformer(
         transformer,
         comphoser_training=comphoser_training,
         logger=logger,
     )
+    if is_stage3:
+        for name, param in transformer.named_parameters():
+            if "lora_" in name and ".default." in name:
+                param.requires_grad = False
+        if qformer is not None:
+            qformer.requires_grad_(False)
+        logger.info(
+            "Stage 3: 'default' LoRA adapter and Q-Former are frozen; only 'downstream' is trainable."
+        )
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -862,11 +886,37 @@ def main(args):
             ):
                 weights.pop(weight_index)
 
-            Flux2KleinPipeline.save_lora_weights(
-                output_dir,
-                transformer_lora_layers=transformer_lora_layers_to_save,
-                **_collate_lora_metadata(modules_to_save),
-            )
+            if is_stage3:
+                # Stage 3 has two LoRA adapters; "default" is frozen but we still serialize it
+                # so the checkpoint dir is self-contained for inference.
+                base_transformer = unwrap_model(transformer_model) if is_fsdp else transformer_model
+                default_layers = get_peft_model_state_dict(
+                    base_transformer, adapter_name="default", **peft_kwargs
+                )
+                downstream_layers = get_peft_model_state_dict(
+                    base_transformer, adapter_name="downstream", **peft_kwargs
+                )
+                if is_fsdp:
+                    default_layers = _to_cpu_contiguous(default_layers)
+                    downstream_layers = _to_cpu_contiguous(downstream_layers)
+                Flux2KleinPipeline.save_lora_weights(
+                    output_dir,
+                    transformer_lora_layers=default_layers,
+                    weight_name="pytorch_lora_weights.safetensors",
+                    **_collate_lora_metadata(modules_to_save),
+                )
+                Flux2KleinPipeline.save_lora_weights(
+                    output_dir,
+                    transformer_lora_layers=downstream_layers,
+                    weight_name="pytorch_lora_weights_downstream.safetensors",
+                    **_collate_lora_metadata(modules_to_save),
+                )
+            else:
+                Flux2KleinPipeline.save_lora_weights(
+                    output_dir,
+                    transformer_lora_layers=transformer_lora_layers_to_save,
+                    **_collate_lora_metadata(modules_to_save),
+                )
             if qformer_model is not None:
                 if comphoser_checkpoint_metadata is None:
                     raise ValueError("Missing ComPhoser checkpoint metadata for Q-Former save")
@@ -903,7 +953,12 @@ def main(args):
                 args.pretrained_model_name_or_path,
                 subfolder="transformer",
             )
-            transformer_.add_adapter(transformer_lora_config)
+            if is_stage3:
+                transformer_.add_adapter(transformer_lora_config, adapter_name="default")
+                transformer_.add_adapter(transformer_lora_config, adapter_name="downstream")
+                transformer_.set_adapters(["default", "downstream"], weights=[1.0, 1.0])
+            else:
+                transformer_.add_adapter(transformer_lora_config)
             if qformer is not None:
                 qformer_ = unwrap_model(qformer)
 
@@ -914,6 +969,17 @@ def main(args):
         }
         transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
         incompatible_keys = set_peft_model_state_dict(transformer_, transformer_state_dict, adapter_name="default")
+        if is_stage3:
+            downstream_state_dict = Flux2KleinPipeline.lora_state_dict(
+                input_dir, weight_name="pytorch_lora_weights_downstream.safetensors"
+            )
+            downstream_state_dict = {
+                f"{k.replace('transformer.', '')}": v
+                for k, v in downstream_state_dict.items()
+                if k.startswith("transformer.")
+            }
+            downstream_state_dict = convert_unet_state_dict_to_peft(downstream_state_dict)
+            set_peft_model_state_dict(transformer_, downstream_state_dict, adapter_name="downstream")
         if incompatible_keys is not None:
             # check only for unexpected keys
             unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
@@ -979,7 +1045,8 @@ def main(args):
     params_to_optimize = [transformer_parameters_with_lr]
     if qformer is not None:
         qformer_parameters = list(filter(lambda p: p.requires_grad, qformer.parameters()))
-        params_to_optimize.append({"params": qformer_parameters, "lr": args.learning_rate})
+        if qformer_parameters:
+            params_to_optimize.append({"params": qformer_parameters, "lr": args.learning_rate})
 
     # Optimizer creation
     if not (args.optimizer.lower() == "prodigy" or args.optimizer.lower() == "adamw"):
@@ -1062,10 +1129,86 @@ def main(args):
         )
         if len(prepared_datasets) == 1:
             train_dataset = prepared_datasets[0]
-            batch_sampler = BucketBatchSampler(train_dataset, batch_size=args.train_batch_size, drop_last=True)
-            sampling_policy = "bucket_only"
         else:
             train_dataset = MultiPreparedPilotDataset(prepared_datasets)
+
+        strategy = getattr(args, "training_strategy", None)
+        if strategy in ("step_by_step_stage3", "single_dataset"):
+            target = getattr(args, "downstream_target_dataset_id", None)
+            if not target:
+                raise ValueError(
+                    f"--training_strategy={strategy} requires --downstream_target_dataset_id"
+                )
+            if isinstance(train_dataset, MultiPreparedPilotDataset):
+                matched = tuple(
+                    ds for ds in train_dataset.datasets if target in ds.dataset_ids
+                )
+            else:
+                matched = (train_dataset,) if target in getattr(train_dataset, "dataset_ids", ()) else ()
+            if matched:
+                train_dataset = matched[0]
+            else:
+                # Fallback: --downstream_target_dataset_id may name a non-catalog folder (e.g.
+                # downstream_*) that auto-discovery filtered out. Try loading data/<target>/ directly.
+                candidate_root = Path("data") / target
+                if not candidate_root.is_dir():
+                    raise ValueError(
+                        f"--downstream_target_dataset_id='{target}' did not match any discovered "
+                        f"dataset for the selected --comphoser_primitive_groups, and data/{target}/ "
+                        "does not exist on disk."
+                    )
+                logger.info(
+                    "Loading downstream target '%s' directly from %s (bypasses family-catalog discovery)",
+                    target,
+                    candidate_root,
+                )
+                train_dataset = PreparedPilotDataset(
+                    candidate_root,
+                    split="train",
+                    backend=args.comphoser_data_backend,
+                    size=args.resolution,
+                    repeats=args.repeats,
+                    center_crop=args.center_crop,
+                    random_flip=args.random_flip,
+                    buckets=buckets,
+                )
+            batch_sampler = BucketBatchSampler(
+                train_dataset, batch_size=args.train_batch_size, drop_last=True, seed=args.seed or 0
+            )
+            sampling_policy = f"{strategy}_single_folder"
+        elif strategy == "step_by_step_stage1":
+            train_dataset = IdentityWrapper(train_dataset)
+            batch_sampler = UniformFolderSampler(
+                train_dataset,
+                batch_size=args.train_batch_size,
+                drop_last=True,
+                seed=args.seed or 0,
+            )
+            sampling_policy = "stage1_identity_uniform_folder"
+        elif strategy == "step_by_step_stage2":
+            if isinstance(train_dataset, MultiPreparedPilotDataset):
+                batch_sampler = PrimitiveGroupBalancedBucketBatchSampler(
+                    train_dataset,
+                    batch_size=args.train_batch_size,
+                    drop_last=True,
+                    seed=args.seed or 0,
+                    dataset_uniform_within_group=True,
+                )
+                sampling_policy = "stage2_group_balanced_dataset_uniform"
+            else:
+                batch_sampler = BucketBatchSampler(
+                    train_dataset, batch_size=args.train_batch_size, drop_last=True, seed=args.seed or 0
+                )
+                sampling_policy = "stage2_single_folder_fallback"
+        elif strategy == "all_in_one":
+            batch_sampler = UniformFolderSampler(
+                train_dataset,
+                batch_size=args.train_batch_size,
+                drop_last=True,
+                seed=args.seed or 0,
+            )
+            sampling_policy = "uniform_folder"
+        elif isinstance(train_dataset, MultiPreparedPilotDataset):
             batch_sampler = PrimitiveGroupBalancedBucketBatchSampler(
                 train_dataset,
                 batch_size=args.train_batch_size,
@@ -1073,6 +1216,11 @@ def main(args):
                 seed=args.seed or 0,
             )
             sampling_policy = "primitive_group_balanced_bucket"
+        else:
+            batch_sampler = BucketBatchSampler(
+                train_dataset, batch_size=args.train_batch_size, drop_last=True, seed=args.seed or 0
+            )
+            sampling_policy = "bucket_only"
         collate_train_examples = collate_prepared_pilot_examples
         logger.info(
             "ComPhoser train dataset ids=%s roots=%s backend=%s sampling_policy=%s",
@@ -1091,7 +1239,10 @@ def main(args):
             buckets=buckets,
         )
         collate_train_examples = collate_fn
-        batch_sampler = BucketBatchSampler(train_dataset, batch_size=args.train_batch_size, drop_last=True)
+        batch_sampler = BucketBatchSampler(
+            train_dataset, batch_size=args.train_batch_size, drop_last=True, seed=args.seed or 0
+        )
+        sampling_policy = "bucket_only"
 
     uses_comphoser_preprocessed_backend = bool(
         comphoser_training.uses_prepared_pilot_dataset and getattr(train_dataset, "uses_preprocessed_backend", False)
@@ -1111,12 +1262,22 @@ def main(args):
         train_dataset=train_dataset,
         qformer=qformer,
         comphoser_training=comphoser_training,
+        sampling_policy=sampling_policy,
     )
+    def _seed_dataloader_worker(worker_id: int) -> None:
+        # Make DataLoader-worker RNG deterministic so any in-worker augmentation
+        # (e.g. the raw-backend random flip) is reproducible with num_workers > 0 (R06).
+        worker_seed = ((args.seed or 0) + worker_id) % (2**32)
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_sampler=batch_sampler,
         collate_fn=collate_train_examples,
         num_workers=args.dataloader_num_workers,
+        worker_init_fn=_seed_dataloader_worker,
     )
 
     def compute_text_embeddings(prompt, text_encoding_pipeline):
@@ -1150,6 +1311,27 @@ def main(args):
             validation_kwargs["negative_prompt_embeds"], _text_ids = compute_text_embeddings(
                 "", text_encoding_pipeline
             )
+
+    # Stage 1 (consistency preservation): pre-encode the two identity prompts now,
+    # before the text-encoding pipeline is dropped for the preprocessed backend.
+    # The training loop will broadcast one of these across each batch (per-batch
+    # coin flip weighted by --stage1_identity_prompt_mix_ratio).
+    stage1_prompt_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None
+    if getattr(args, "training_strategy", None) == "step_by_step_stage1":
+        with offload_models(text_encoding_pipeline, device=accelerator.device, offload=args.offload):
+            empty_embeds, empty_text_ids = compute_text_embeddings("", text_encoding_pipeline)
+            preserve_embeds, preserve_text_ids = compute_text_embeddings(
+                STAGE1_PRESERVE_PROMPT, text_encoding_pipeline
+            )
+        stage1_prompt_cache = {
+            "empty": (empty_embeds.detach().cpu(), empty_text_ids.detach().cpu()),
+            "preserve": (preserve_embeds.detach().cpu(), preserve_text_ids.detach().cpu()),
+        }
+        logger.info(
+            "Stage 1 prompts pre-encoded: empty + preserve='%s'; mix_ratio=%.2f",
+            STAGE1_PRESERVE_PROMPT,
+            args.stage1_identity_prompt_mix_ratio,
+        )
 
     # Init FSDP for text encoder
     if args.fsdp_text_encoder:
@@ -1301,6 +1483,64 @@ def main(args):
     global_step = 0
     first_epoch = 0
 
+    # Warm-start from another stage's checkpoint: load LoRA + Q-Former weights only,
+    # leave optimizer/LR scheduler/global_step at fresh defaults. Used to chain training
+    # stages (e.g. Stage 2 starting from Stage 1's final checkpoint).
+    if args.init_from_checkpoint:
+        init_dir = args.init_from_checkpoint
+        if not os.path.isdir(init_dir):
+            raise FileNotFoundError(
+                f"--init_from_checkpoint directory not found: {init_dir}"
+            )
+        if is_fsdp:
+            raise NotImplementedError(
+                "--init_from_checkpoint is not supported under FSDP. Use --resume_from_checkpoint "
+                "with continuation semantics instead."
+            )
+        accelerator.print(f"Warm-starting from {init_dir} (weights only)")
+
+        lora_state_dict = Flux2KleinPipeline.lora_state_dict(init_dir)
+        transformer_state_dict = {
+            f"{k.replace('transformer.', '')}": v
+            for k, v in lora_state_dict.items()
+            if k.startswith("transformer.")
+        }
+        transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
+        incompatible_keys = set_peft_model_state_dict(
+            unwrap_model(transformer), transformer_state_dict, adapter_name="default"
+        )
+        if incompatible_keys is not None:
+            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+            if unexpected_keys:
+                logger.warning(
+                    "Warm-start LoRA load produced unexpected keys (skipped): %s",
+                    unexpected_keys,
+                )
+
+        if qformer is not None and has_pilot_qformer_checkpoint(init_dir):
+            qformer_metadata = load_pilot_qformer_checkpoint(
+                init_dir,
+                qformer=unwrap_model(qformer),
+                expected_primitive_groups=comphoser_training.training_spec.controls.primitive_groups,
+            )
+            logger.info(
+                "Warm-started Q-Former from %s (groups=%s, queries=%s)",
+                init_dir,
+                qformer_metadata["primitive_groups"],
+                qformer_metadata["query_count"],
+            )
+        elif qformer is not None:
+            logger.warning(
+                "Warm-start: no Q-Former checkpoint found under %s; controller will start at random init.",
+                init_dir,
+            )
+
+        if args.mixed_precision == "fp16":
+            models_to_upcast = [unwrap_model(transformer)]
+            if qformer is not None:
+                models_to_upcast.append(unwrap_model(qformer))
+            cast_training_params(models_to_upcast)
+
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
@@ -1325,6 +1565,10 @@ def main(args):
 
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
+            # Restore the sampler epoch so a resumed run reproduces the ordering of an
+            # uninterrupted run (the samplers key their shuffle on seed + epoch) (R06).
+            if hasattr(batch_sampler, "set_epoch"):
+                batch_sampler.set_epoch(first_epoch)
 
     else:
         initial_global_step = 0
@@ -1372,7 +1616,17 @@ def main(args):
             for key, value in source_state_dict.items()
         }
 
+    # Cyclic-validation counter for periodic calls — incremented per run_periodic_validation
+    # firing so each call advances to the next chunk of the fan-out task list.
+    periodic_validation_chunk_state = {"index": 0}
+
     def run_periodic_validation(step_index: int) -> None:
+        # Stage 3 trains a second LoRA adapter; the periodic-validation pipeline path
+        # (build_detached_validation_pipeline) is single-adapter only, so periodic validation
+        # would produce wrong results. End-of-training validation (run_final_comphoser_export)
+        # loads both adapters correctly and stays enabled.
+        if getattr(args, "training_strategy", None) == "step_by_step_stage3":
+            return
         should_run_validation = (
             args.validation_steps is not None
             and args.validation_steps > 0
@@ -1415,6 +1669,10 @@ def main(args):
                         unwrap_model(qformer),
                         state_dict=validation_qformer_state_dict,
                     )
+                periodic_offload_enabled = resolve_validation_enable_model_cpu_offload(
+                    getattr(args, "validation_model_cpu_offload", "auto"),
+                    accelerator.device,
+                )
                 pipeline = build_detached_validation_pipeline(
                     pretrained_model_name_or_path=args.pretrained_model_name_or_path,
                     revision=args.revision,
@@ -1423,9 +1681,15 @@ def main(args):
                     transformer_lora_config=transformer_lora_config,
                     transformer_lora_state_dict=validation_transformer_lora_state_dict,
                     include_text_encoder=True,
-                    enable_model_cpu_offload=True,
+                    enable_model_cpu_offload=periodic_offload_enabled,
                     logger=logger,
                 )
+                if not periodic_offload_enabled:
+                    pipeline.to(accelerator.device)
+                periodic_chunk_size = getattr(args, "validation_chunk_size", None)
+                periodic_chunk_index = periodic_validation_chunk_state["index"]
+                if periodic_chunk_size and periodic_chunk_size > 0:
+                    periodic_validation_chunk_state["index"] = periodic_chunk_index + 1
                 validation_results = run_comphoser_validation(
                     args.output_dir,
                     args=args,
@@ -1434,6 +1698,8 @@ def main(args):
                     qformer=validation_qformer,
                     logger=logger,
                     artifact_subdir=f"periodic_validation/step_{step_index:06d}",
+                    chunk_size=periodic_chunk_size,
+                    chunk_index=periodic_chunk_index,
                 )
                 _log_comphoser_validation_results(accelerator, validation_results, step=step_index)
             else:
@@ -1466,10 +1732,21 @@ def main(args):
     if initial_global_step == 0:
         run_periodic_validation(0)
 
+    stage1_prompt_rng = (
+        random.Random((args.seed or 0) + 17)
+        if stage1_prompt_cache is not None
+        else None
+    )
+
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
         if qformer is not None:
-            qformer.train()
+            # Stage 3 freezes the Q-Former (requires_grad=False); keep it in eval mode for
+            # consistency with that intent. Other strategies still train it.
+            if is_stage3:
+                qformer.eval()
+            else:
+                qformer.train()
 
         for step, batch in enumerate(train_dataloader):
             models_to_accumulate = [transformer]
@@ -1498,6 +1775,19 @@ def main(args):
                     num_repeat_elements = len(prompts)
                     prompt_embeds = prompt_embeds.repeat(num_repeat_elements, 1, 1)
                     text_ids = text_ids.repeat(num_repeat_elements, 1, 1)
+
+                if stage1_prompt_cache is not None:
+                    # Stage 1: per-batch coin flip selects which precomputed identity prompt to broadcast.
+                    use_preserve = stage1_prompt_rng.random() < args.stage1_identity_prompt_mix_ratio
+                    chosen_key = "preserve" if use_preserve else "empty"
+                    chosen_embeds, chosen_text_ids = stage1_prompt_cache[chosen_key]
+                    batch_size = prompt_embeds.shape[0]
+                    prompt_embeds = chosen_embeds.expand(batch_size, *chosen_embeds.shape[1:]).to(
+                        device=accelerator.device, non_blocking=True, dtype=weight_dtype
+                    )
+                    text_ids = chosen_text_ids.expand(batch_size, *chosen_text_ids.shape[1:]).to(
+                        device=accelerator.device, non_blocking=True
+                    )
 
                 # Convert images to latent space
                 if uses_comphoser_preprocessed_backend:
@@ -1633,22 +1923,41 @@ def main(args):
                 gate_loss = None
                 current_gate_loss_weight = None
                 loss = image_loss
-                if qformer is not None:
+                # No auxiliary gate-loss term for Stage 1 (identity), all-in-one (no family
+                # concept), or Stage 3 (Q-Former frozen). The controller still runs forward.
+                skip_gate_loss = should_skip_gate_loss(getattr(args, "training_strategy", None))
+                if qformer is not None and not skip_gate_loss:
                     if conditioning.raw_query_gates is None or conditioning.gate_targets is None:
                         raise ValueError("Missing Q-Former gate tensors for auxiliary loss computation")
-                    gate_loss = build_pilot_qformer_auxiliary_loss(
-                        conditioning.raw_query_gates,
-                        conditioning.gate_targets,
-                    )
-                    # Use completed optimizer steps so all gradient-accumulation microsteps share one coefficient.
-                    current_gate_loss_weight = resolve_pilot_gate_loss_weight(
-                        args.comphoser_gate_loss_weight_initial,
-                        args.comphoser_gate_loss_weight_final,
-                        args.comphoser_gate_loss_weight_scheduler,
-                        current_step=global_step,
-                        total_steps=args.max_train_steps,
-                    )
-                    loss = loss + (current_gate_loss_weight * gate_loss)
+                    raw_gates = conditioning.raw_query_gates
+                    gate_targets = conditioning.gate_targets
+                    # Exclude identity rows from the BCE (R05). Derived-contract datasets emit an
+                    # identity row per sample that reuses the task prompt but carries an all-zero
+                    # gate target; under prompt-only routing that directly contradicts the task
+                    # row for the identical prompt and ~halves the effective gate supervision.
+                    # Identity rows still drive the image loss; only the gate BCE skips them.
+                    modes = batch.get("modes")
+                    if modes is not None:
+                        keep_flags = [mode != "identity" for mode in modes]
+                        if not all(keep_flags):
+                            if any(keep_flags):
+                                keep = torch.tensor(keep_flags, device=raw_gates.device, dtype=torch.bool)
+                                raw_gates = raw_gates[keep]
+                                gate_targets = gate_targets[keep]
+                            else:
+                                # Entire batch is identity rows: no family supervision this step.
+                                raw_gates = None
+                    if raw_gates is not None:
+                        gate_loss = build_pilot_qformer_auxiliary_loss(raw_gates, gate_targets)
+                        # Use completed optimizer steps so all gradient-accumulation microsteps share one coefficient.
+                        current_gate_loss_weight = resolve_pilot_gate_loss_weight(
+                            args.comphoser_gate_loss_weight_initial,
+                            args.comphoser_gate_loss_weight_final,
+                            args.comphoser_gate_loss_weight_scheduler,
+                            current_step=global_step,
+                            total_steps=args.max_train_steps,
+                        )
+                        loss = loss + (current_gate_loss_weight * gate_loss)
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1705,7 +2014,14 @@ def main(args):
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             if qformer is not None:
                 logs["image_loss"] = image_loss.detach().item()
-                logs["qformer_gate_loss"] = gate_loss.detach().item() if gate_loss is not None else 0.0
+                # Distinguish "gate loss skipped/not computed" from a genuine 0.0: log NaN +
+                # a 0/1 computed flag rather than coercing the skipped case to 0.0 (R30).
+                if gate_loss is not None:
+                    logs["qformer_gate_loss"] = gate_loss.detach().item()
+                    logs["qformer_gate_loss_computed"] = 1.0
+                else:
+                    logs["qformer_gate_loss"] = float("nan")
+                    logs["qformer_gate_loss_computed"] = 0.0
                 logs["qformer_gate_loss_weight"] = float(current_gate_loss_weight or 0.0)
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
@@ -1752,11 +2068,37 @@ def main(args):
 
         modules_to_save["transformer"] = transformer
 
-        Flux2KleinPipeline.save_lora_weights(
-            save_directory=args.output_dir,
-            transformer_lora_layers=transformer_lora_layers,
-            **_collate_lora_metadata(modules_to_save),
-        )
+        if is_stage3:
+            # Stage 3 final save: write both adapters into the output dir so it's self-contained.
+            base_transformer = unwrap_model(transformer) if not is_fsdp else transformer
+            peft_kwargs_final = {"state_dict": state_dict} if is_fsdp else {}
+            default_layers = get_peft_model_state_dict(
+                base_transformer, adapter_name="default", **peft_kwargs_final
+            )
+            downstream_layers = get_peft_model_state_dict(
+                base_transformer, adapter_name="downstream", **peft_kwargs_final
+            )
+            if is_fsdp:
+                default_layers = _to_cpu_contiguous(default_layers)
+                downstream_layers = _to_cpu_contiguous(downstream_layers)
+            Flux2KleinPipeline.save_lora_weights(
+                save_directory=args.output_dir,
+                transformer_lora_layers=default_layers,
+                weight_name="pytorch_lora_weights.safetensors",
+                **_collate_lora_metadata(modules_to_save),
+            )
+            Flux2KleinPipeline.save_lora_weights(
+                save_directory=args.output_dir,
+                transformer_lora_layers=downstream_layers,
+                weight_name="pytorch_lora_weights_downstream.safetensors",
+                **_collate_lora_metadata(modules_to_save),
+            )
+        else:
+            Flux2KleinPipeline.save_lora_weights(
+                save_directory=args.output_dir,
+                transformer_lora_layers=transformer_lora_layers,
+                **_collate_lora_metadata(modules_to_save),
+            )
 
         final_export_validation_results = run_final_comphoser_export(
             args,
@@ -1789,7 +2131,13 @@ def main(args):
                     torch_dtype=weight_dtype,
                 )
                 pipeline.load_lora_weights(args.output_dir)
-                pipeline.enable_model_cpu_offload()
+                if resolve_validation_enable_model_cpu_offload(
+                    getattr(args, "validation_model_cpu_offload", "auto"),
+                    accelerator.device,
+                ):
+                    pipeline.enable_model_cpu_offload()
+                else:
+                    pipeline.to(accelerator.device)
                 pipeline.set_progress_bar_config(disable=True)
                 validation_results = run_comphoser_validation(
                     args.output_dir,

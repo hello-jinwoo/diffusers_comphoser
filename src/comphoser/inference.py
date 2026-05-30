@@ -17,12 +17,22 @@ from .controls import PILOT_PRIMITIVE_FAMILY_ORDER, PILOT_QUERIES_PER_PRIMITIVE,
 from .datasets import PreparedPilotRecord
 from .image_utils import load_rgb_image, save_rgb_image
 from .metrics import compute_image_metrics, image_metric_units, unavailable_image_metrics
-from .qformer import ComPhoserQFormer, QFORMER_RUNTIME_GATE_MODE_PREDICTED_ONLY
+from .qformer import ComPhoserQFormer
 from .training import build_pilot_qformer_auxiliary_loss, prepare_pilot_transformer_conditioning
 
 CONTROLLED_VALIDATION_COMPARISON_MODES = ("flux_only", "lora_only", "lora_qformer")
 CONTROLLED_VALIDATION_ARTIFACT_SUBDIR = "controlled_validation"
-CONTROLLED_VALIDATION_ARTIFACT_VERSION = "comphoser-controlled-validation-v6"
+# Controlled-validation artifact schema. Bump when changing the on-disk format consumed by
+# downstream tooling. Major history:
+#   v9 (2026-05-28) — added `qformer_gate_accuracy_chance_pct` and
+#                     `qformer_gate_balanced_accuracy_pct` to the gate summary / metrics so the
+#                     raw gate accuracy can be read against its ~75% chance baseline (R20);
+#                     per-task std now uses sample std (ddof=1) instead of population std (R33).
+#   v8 (2026-05-25) — added `lpips_alex` to per-output / per-sample / per-task metrics blocks.
+#   v7 (2026-05-19) — pre-masking retired; predicted gates drive the bank directly, family
+#                     mask is the BCE training target only.
+#   v6              — previous schema with pre-masking semantics.
+CONTROLLED_VALIDATION_ARTIFACT_VERSION = "comphoser-controlled-validation-v9"
 DEFAULT_CONTROLLED_VALIDATION_STEPS = 8
 DEFAULT_CONTROLLED_VALIDATION_SEEDS_PER_IMAGE = 2
 DEFAULT_CONTROLLED_VALIDATION_PROMPT_VARIANTS = (
@@ -467,7 +477,6 @@ def save_validation_artifacts(
         "num_validation_seeds_per_image": num_outputs_per_sample,
         "num_inference_steps": num_inference_steps,
         "guidance_scale": guidance_scale,
-        "runtime_gate_mode": QFORMER_RUNTIME_GATE_MODE_PREDICTED_ONLY,
         "explicit_token_masking": _serialize_explicit_token_masking(explicit_token_masking),
         "explicit_token_masking_applied": explicit_token_masking is not None,
         "metrics": _build_task_metric_summary(samples),
@@ -670,7 +679,6 @@ def _summarize_query_gates(
 ) -> dict[str, Any]:
     if gate_targets is None or raw_query_gates is None or predicted_query_gates is None or query_gates is None:
         return {
-            "runtime_gate_mode": QFORMER_RUNTIME_GATE_MODE_PREDICTED_ONLY,
             "explicit_token_masking": _serialize_explicit_token_masking(explicit_token_masking),
             "explicit_token_masking_applied": bool(explicit_token_masking_applied),
             "primitive_family_order": list(PILOT_PRIMITIVE_FAMILY_ORDER),
@@ -692,6 +700,8 @@ def _summarize_query_gates(
             "active_query_gate_min": None,
             "active_query_gate_max": None,
             "qformer_gate_accuracy_pct": None,
+            "qformer_gate_accuracy_chance_pct": None,
+            "qformer_gate_balanced_accuracy_pct": None,
             "qformer_gate_loss": None,
             "target_gate_mass": None,
             "off_target_gate_mass": None,
@@ -709,6 +719,31 @@ def _summarize_query_gates(
     thresholded_targets = (target_values >= 0.5).to(dtype=torch.bool)
     thresholded_predictions = (predicted_values >= 0.5).to(dtype=torch.bool)
     gate_accuracy_pct = float((thresholded_predictions == thresholded_targets).to(dtype=torch.float32).mean().item() * 100.0)
+    # Chance baseline + balanced accuracy (R20): with 4 active of 16 slots a do-nothing
+    # all-inactive predictor already scores ~75% raw accuracy, so the bare accuracy is
+    # uninterpretable on its own. Chance = the all-inactive accuracy; balanced accuracy
+    # averages the active-slot and inactive-slot accuracies so a collapsed-to-zero gate
+    # head scores ~50%, not ~75%.
+    inactive_targets = ~thresholded_targets
+    gate_accuracy_chance_pct = float(inactive_targets.to(dtype=torch.float32).mean().item() * 100.0)
+    balanced_parts: list[float] = []
+    if bool(thresholded_targets.any()):
+        balanced_parts.append(
+            (thresholded_predictions[thresholded_targets] == thresholded_targets[thresholded_targets])
+            .to(dtype=torch.float32)
+            .mean()
+            .item()
+        )
+    if bool(inactive_targets.any()):
+        balanced_parts.append(
+            (thresholded_predictions[inactive_targets] == thresholded_targets[inactive_targets])
+            .to(dtype=torch.float32)
+            .mean()
+            .item()
+        )
+    gate_balanced_accuracy_pct = (
+        float(sum(balanced_parts) / len(balanced_parts) * 100.0) if balanced_parts else float("nan")
+    )
     gate_loss = float(
         build_pilot_qformer_auxiliary_loss(
             raw_query_gates.detach().cpu().reshape(1, -1),
@@ -728,7 +763,6 @@ def _summarize_query_gates(
         .item()
     )
     return {
-        "runtime_gate_mode": QFORMER_RUNTIME_GATE_MODE_PREDICTED_ONLY,
         "explicit_token_masking": _serialize_explicit_token_masking(explicit_token_masking),
         "explicit_token_masking_applied": bool(explicit_token_masking_applied),
         "primitive_family_order": list(PILOT_PRIMITIVE_FAMILY_ORDER),
@@ -750,6 +784,8 @@ def _summarize_query_gates(
         "active_query_gate_min": float(effective_values.min().item()),
         "active_query_gate_max": float(effective_values.max().item()),
         "qformer_gate_accuracy_pct": gate_accuracy_pct,
+        "qformer_gate_accuracy_chance_pct": gate_accuracy_chance_pct,
+        "qformer_gate_balanced_accuracy_pct": gate_balanced_accuracy_pct,
         "qformer_gate_loss": gate_loss,
         "target_gate_mass": target_gate_mass,
         "off_target_gate_mass": off_target_gate_mass,
@@ -843,7 +879,9 @@ def _build_metric_summary(
         "unit": unit,
     }
     if include_std:
-        summary["std"] = float(array.std(ddof=0))
+        # Sample standard deviation (ddof=1) to match benchmark convention; population std
+        # (ddof=0) understates variance vs the literature (R33). Undefined for n<2 -> 0.0.
+        summary["std"] = float(array.std(ddof=1)) if array.size > 1 else 0.0
         summary["sample_count"] = int(sample_count if sample_count is not None else 0)
     return summary
 
@@ -871,6 +909,14 @@ def _build_sample_metric_summary(outputs: Sequence[Mapping[str, Any]]) -> dict[s
                 _extract_sample_metric_values(outputs, "qformer_gate_accuracy_pct"),
                 unit="%",
             ),
+            "qformer_gate_accuracy_chance_pct": _build_metric_summary(
+                _extract_sample_metric_values(outputs, "qformer_gate_accuracy_chance_pct"),
+                unit="%",
+            ),
+            "qformer_gate_balanced_accuracy_pct": _build_metric_summary(
+                _extract_sample_metric_values(outputs, "qformer_gate_balanced_accuracy_pct"),
+                unit="%",
+            ),
             "qformer_gate_loss": _build_metric_summary(
                 _extract_sample_metric_values(outputs, "qformer_gate_loss"),
                 unit="loss",
@@ -883,6 +929,8 @@ def _build_sample_metric_summary(outputs: Sequence[Mapping[str, Any]]) -> dict[s
 def _build_task_metric_summary(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     metric_specs = tuple(image_metric_units().items()) + (
         ("qformer_gate_accuracy_pct", "%"),
+        ("qformer_gate_accuracy_chance_pct", "%"),
+        ("qformer_gate_balanced_accuracy_pct", "%"),
         ("qformer_gate_loss", "loss"),
     )
     task_metrics: dict[str, Any] = {}
@@ -957,6 +1005,8 @@ def _serialize_validation_run(
 ) -> dict[str, Any]:
     serialized_metrics = dict(metrics)
     serialized_metrics["qformer_gate_accuracy_pct"] = run_summary["qformer_gate_accuracy_pct"]
+    serialized_metrics["qformer_gate_accuracy_chance_pct"] = run_summary["qformer_gate_accuracy_chance_pct"]
+    serialized_metrics["qformer_gate_balanced_accuracy_pct"] = run_summary["qformer_gate_balanced_accuracy_pct"]
     serialized_metrics["qformer_gate_loss"] = run_summary["qformer_gate_loss"]
     return {
         "output_index": output_index,
@@ -968,7 +1018,6 @@ def _serialize_validation_run(
         "added_token_count": run_summary["added_token_count"],
         "height": run_summary["height"],
         "width": run_summary["width"],
-        "runtime_gate_mode": run_summary["runtime_gate_mode"],
         "explicit_token_masking": run_summary["explicit_token_masking"],
         "explicit_token_masking_applied": run_summary["explicit_token_masking_applied"],
         "primitive_family_order": run_summary["primitive_family_order"],
@@ -990,6 +1039,8 @@ def _serialize_validation_run(
         "active_query_gate_min": run_summary["active_query_gate_min"],
         "active_query_gate_max": run_summary["active_query_gate_max"],
         "qformer_gate_accuracy_pct": run_summary["qformer_gate_accuracy_pct"],
+        "qformer_gate_accuracy_chance_pct": run_summary["qformer_gate_accuracy_chance_pct"],
+        "qformer_gate_balanced_accuracy_pct": run_summary["qformer_gate_balanced_accuracy_pct"],
         "qformer_gate_loss": run_summary["qformer_gate_loss"],
         "target_gate_mass": run_summary["target_gate_mass"],
         "off_target_gate_mass": run_summary["off_target_gate_mass"],

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -17,12 +18,14 @@ from .controls import (
     PILOT_CHECKPOINT_METADATA_FIELDS,
     PILOT_CHECKPOINT_METADATA_VERSION,
     PILOT_PRIMITIVE_FAMILY_ORDER,
+    PrimitiveTaskSpec,
     ResolvedPrimitiveSelection,
     build_pilot_checkpoint_metadata,
     get_task_spec,
-    get_task_spec_for_primitive_group,
+    get_task_specs_for_primitive_group,
     normalize_primitive_groups,
     resolve_control_selection,
+    resolve_dataset_task_spec_by_id,
     resolve_primitive_group,
 )
 from .datasets import PREPARED_RECORD_SOURCE_DERIVED_CONTRACT, PREPARED_RECORD_SOURCE_MANIFEST
@@ -31,7 +34,6 @@ from .qformer import (
     DEFAULT_QFORMER_QUERY_COUNT,
     ComPhoserQFormer,
     QFORMER_CONTROLLER_LAYOUT_PROMPT_ROUTER_V2,
-    QFORMER_RUNTIME_GATE_MODE_PREDICTED_ONLY,
     append_query_tokens_to_prompt,
 )
 
@@ -66,6 +68,7 @@ class PilotTrainingRuntimeSpec:
     mode: str
     training_spec: TrainingControlSpec
     dataset_roots: tuple[str, ...]
+    training_task_specs: tuple[PrimitiveTaskSpec, ...] = ()
     qformer_num_queries: int | None = None
     qformer_num_layers: int | None = None
 
@@ -145,6 +148,9 @@ def resolve_pilot_training_runtime(
     qformer_num_queries: int | None = None,
     qformer_num_layers: int | None = None,
     metadata_overrides: Mapping[str, Mapping[str, object]] | None = None,
+    exclude_dataset_ids: Sequence[str] | None = None,
+    train_dataset_ids: Sequence[str] | None = None,
+    include_non_catalog_in_discovery: bool = False,
 ) -> PilotTrainingRuntimeSpec:
     if run_mode not in PILOT_TRAINING_MODES:
         supported = ", ".join(PILOT_TRAINING_MODES)
@@ -168,20 +174,75 @@ def resolve_pilot_training_runtime(
     if not training_spec.controls.primitive_groups:
         raise ValueError("ComPhoser pilot modes require at least one active primitive group")
 
-    dataset_tasks: list[object] = []
-    missing_groups: list[str] = []
-    for primitive_group in training_spec.controls.primitive_groups:
-        task = get_task_spec_for_primitive_group(primitive_group)
-        if task is None or not task.is_dataset_ready:
-            missing_groups.append(primitive_group)
-            continue
-        dataset_tasks.append(task)
+    dataset_tasks: list[PrimitiveTaskSpec] = []
+    if train_dataset_ids:
+        # Explicit allow-list: bypass the primitive_groups filter and the
+        # exclude_dataset_ids subtraction entirely. Each name is resolved either to a
+        # discovered catalog task or to a synthetic non-catalog spec via the contract
+        # folder under data/.
+        requested = list(dict.fromkeys(str(name) for name in train_dataset_ids if name))
+        if not requested:
+            raise ValueError("--train_dataset_ids was provided but resolved to an empty list")
+        for name in requested:
+            dataset_tasks.append(resolve_dataset_task_spec_by_id(name))
+        if exclude_dataset_ids:
+            warnings.warn(
+                "--exclude_dataset_ids is ignored when --train_dataset_ids is set "
+                "(the explicit list is treated as exhaustive).",
+                stacklevel=2,
+            )
+    else:
+        missing_groups: list[str] = []
+        for primitive_group in training_spec.controls.primitive_groups:
+            group_tasks = tuple(
+                task for task in get_task_specs_for_primitive_group(primitive_group) if task.is_dataset_ready
+            )
+            if not group_tasks:
+                missing_groups.append(primitive_group)
+                continue
+            dataset_tasks.extend(group_tasks)
 
-    if missing_groups:
-        missing = ", ".join(missing_groups)
-        raise NotImplementedError(
-            f"ComPhoser training does not have dataset-backed task routing for primitive groups: {missing}"
-        )
+        if missing_groups:
+            missing = ", ".join(missing_groups)
+            raise NotImplementedError(
+                f"ComPhoser training does not have dataset-backed task routing for primitive groups: {missing}"
+            )
+
+        if include_non_catalog_in_discovery:
+            # All-in-one mode: the catalog gate is not utilized on the supervision side
+            # (no per-family BCE loss), so surface non-catalog folders too (e.g. downstream_*).
+            # They enter with primitive_group="" and the trainer's existing no-family handling
+            # produces an all-zero gate_targets mask for those samples.
+            from .controls import discover_dataset_task_specs as _discover_all
+
+            seen = {task.dataset_id for task in dataset_tasks}
+            for spec in _discover_all(include_non_catalog=True):
+                if not spec.is_dataset_ready:
+                    continue
+                if spec.primitive_group:
+                    continue  # catalog spec, already collected above
+                if spec.dataset_id in seen:
+                    continue
+                dataset_tasks.append(spec)
+                seen.add(spec.dataset_id)
+
+    if exclude_dataset_ids and not train_dataset_ids:
+        excluded = {str(name) for name in exclude_dataset_ids if name}
+        if excluded:
+            pre_ids = {task.dataset_id for task in dataset_tasks}
+            unmatched = excluded - pre_ids
+            if unmatched:
+                warnings.warn(
+                    "--exclude_dataset_ids contains entries that did not match any discovered "
+                    f"dataset for the selected primitive_groups: {sorted(unmatched)}",
+                    stacklevel=2,
+                )
+            dataset_tasks = [task for task in dataset_tasks if task.dataset_id not in excluded]
+            if not dataset_tasks:
+                raise ValueError(
+                    "--exclude_dataset_ids removed every discovered dataset for the selected "
+                    "primitive_groups; nothing left to train on"
+                )
 
     if run_mode == "lora_qformer":
         if qformer_num_queries is None or qformer_num_queries <= 0:
@@ -197,10 +258,21 @@ def resolve_pilot_training_runtime(
         resolved_num_layers = None
 
     dataset_roots = tuple(dict.fromkeys(task.dataset_root for task in dataset_tasks))
+    # Preserve the actual training-task list (catalog + any non-catalog folders surfaced via
+    # include_non_catalog_in_discovery or --train_dataset_ids). Validation fan-out reads this
+    # so it covers exactly what was trained; controls.tasks is catalog-only by design.
+    seen_dataset_ids: set[str] = set()
+    deduped_training_tasks: list[PrimitiveTaskSpec] = []
+    for task in dataset_tasks:
+        if task.dataset_id in seen_dataset_ids:
+            continue
+        seen_dataset_ids.add(task.dataset_id)
+        deduped_training_tasks.append(task)
     return PilotTrainingRuntimeSpec(
         mode=run_mode,
         training_spec=training_spec,
         dataset_roots=dataset_roots,
+        training_task_specs=tuple(deduped_training_tasks),
         qformer_num_queries=qformer_num_queries if run_mode == "lora_qformer" else None,
         qformer_num_layers=resolved_num_layers,
     )
@@ -233,7 +305,18 @@ def resolve_pilot_batch_primitive_controls(
         for task_id, strength in zip(normalized_task_ids, normalized_strengths):
             if not 0.0 <= strength <= 1.0:
                 raise ValueError(f"Sample {sample_index} task strength must stay within [0.0, 1.0]")
-            task_spec = get_task_spec(task_id)
+            try:
+                task_spec = get_task_spec(task_id)
+            except KeyError:
+                # Non-catalog task_id (e.g. downstream_isp__ZRR loaded via the direct-load
+                # fallback for --downstream_target_dataset_id). Treat as "no active family" —
+                # the QFormer produces an all-zero gate_targets mask for this sample. The
+                # strategies that skip the BCE (step_by_step_stage1/3, all_in_one) never consume
+                # it; the strategies that DO compute it (step_by_step_stage2, single_dataset,
+                # legacy None) are expected to train on catalog folders, so an all-zero target
+                # here only arises from a non-catalog folder under one of those strategies (e.g.
+                # single_dataset on a downstream_* folder), where it pushes every gate toward 0.
+                continue
             grouped_strengths[task_spec.primitive_group] = max(grouped_strengths.get(task_spec.primitive_group, 0.0), strength)
 
         if len(grouped_strengths) > 1:
@@ -289,6 +372,20 @@ def build_pilot_qformer_auxiliary_loss(
             f"{tuple(raw_query_gates.shape)} vs {tuple(gate_targets.shape)}"
         )
     return F.binary_cross_entropy_with_logits(raw_query_gates.float(), gate_targets.float())
+
+
+_GATE_LOSS_SKIPPING_STRATEGIES = frozenset({"step_by_step_stage1", "all_in_one", "step_by_step_stage3"})
+
+
+def should_skip_gate_loss(training_strategy: str | None) -> bool:
+    """Whether the BCE auxiliary gate loss should be skipped for this training strategy.
+
+    Stage 1 trains identity with no per-sample family target, all-in-one treats every task
+    equally without a family concept, and Stage 3 has a frozen Q-Former (any BCE here would
+    just be no-op gradients on frozen params). Other strategies — None (legacy), Stage 2,
+    single_dataset — compute the BCE gate loss normally.
+    """
+    return training_strategy in _GATE_LOSS_SKIPPING_STRATEGIES
 
 
 def resolve_pilot_gate_loss_weight(
@@ -374,6 +471,7 @@ def build_pilot_qformer_checkpoint_metadata(
     gate_loss_weight_initial: float | None = None,
     gate_loss_weight_final: float | None = None,
     gate_loss_weight_scheduler: str = "linear",
+    extra_metadata: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     resolved_initial_weight = float(gate_loss_weight if gate_loss_weight_initial is None else gate_loss_weight_initial)
     resolved_final_weight = float(gate_loss_weight if gate_loss_weight_final is None else gate_loss_weight_final)
@@ -406,7 +504,10 @@ def build_pilot_qformer_checkpoint_metadata(
         cond_token_dim=qformer.cond_token_dim,
         controller_layout=QFORMER_CONTROLLER_LAYOUT_PROMPT_ROUTER_V2,
         routing_context="prompt_only",
-        runtime_gate_mode=QFORMER_RUNTIME_GATE_MODE_PREDICTED_ONLY,
+        # Run-provenance fields (training_strategy / sampling_policy / seed). Recorded so a
+        # checkpoint alone identifies which strategy + config produced it (R13). These are
+        # additive — not in PILOT_CHECKPOINT_METADATA_FIELDS — so legacy checkpoints still load.
+        **{str(key): value for key, value in dict(extra_metadata or {}).items()},
     )
 
 
@@ -506,12 +607,6 @@ def validate_pilot_qformer_checkpoint_metadata(
         raise ValueError(
             f"Checkpoint metadata primitive_family_order {primitive_family_order} does not match "
             f"expected fixed-bank order {PILOT_PRIMITIVE_FAMILY_ORDER}"
-        )
-
-    if metadata.get("runtime_gate_mode") != QFORMER_RUNTIME_GATE_MODE_PREDICTED_ONLY:
-        raise ValueError(
-            "This checkpoint was trained with target-masked runtime gates or missing router metadata; "
-            "retrain with predicted-only routing before using the current lora_qformer path."
         )
 
     if expected_primitive_groups is not None:
@@ -634,6 +729,45 @@ def resolve_validation_inference_mode(training_mode: str) -> str:
         raise ValueError(f"Unsupported training mode '{training_mode}'. Expected one of: {supported}") from error
 
 
+VALIDATION_MODEL_CPU_OFFLOAD_POLICIES = ("auto", "on", "off")
+# Threshold for the `auto` policy: when total device VRAM is at least this many GiB, we skip
+# diffusers' enable_model_cpu_offload() and keep the validation pipeline GPU-resident. FLUX.2
+# Klein 4B at bf16 peaks around 27 GiB during inference; 48 GiB leaves comfortable headroom
+# for the training-side transformer that stays resident on the same device during periodic
+# validation. Smaller GPUs fall back to offload to avoid OOM.
+VALIDATION_AUTO_GPU_RESIDENT_VRAM_GIB = 48
+
+
+def resolve_validation_enable_model_cpu_offload(
+    policy: str,
+    device: torch.device | str | None,
+) -> bool:
+    """Resolve the validation-pipeline CPU-offload decision for ``policy`` on ``device``.
+
+    Returns ``True`` if `enable_model_cpu_offload()` should be applied to the validation
+    pipeline, ``False`` if the pipeline should be kept GPU-resident.
+    """
+
+    if policy not in VALIDATION_MODEL_CPU_OFFLOAD_POLICIES:
+        supported = ", ".join(VALIDATION_MODEL_CPU_OFFLOAD_POLICIES)
+        raise ValueError(
+            f"Unsupported validation_model_cpu_offload policy '{policy}'. Expected one of: {supported}"
+        )
+    if policy == "on":
+        return True
+    if policy == "off":
+        return False
+    # auto
+    if device is None:
+        return True
+    resolved = torch.device(device) if not isinstance(device, torch.device) else device
+    if resolved.type != "cuda":
+        return False
+    properties = torch.cuda.get_device_properties(resolved)
+    total_gib = properties.total_memory / (1024**3)
+    return total_gib < VALIDATION_AUTO_GPU_RESIDENT_VRAM_GIB
+
+
 def split_pilot_qformer_state_dict(
     state_dict: Mapping[str, Tensor],
 ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
@@ -711,8 +845,9 @@ __all__ = [
     "PILOT_GATE_LOSS_WEIGHT_SCHEDULERS",
     "PILOT_TRAINING_MODES",
     "QFORMER_CONTROLLER_LAYOUT_PROMPT_ROUTER_V2",
-    "QFORMER_RUNTIME_GATE_MODE_PREDICTED_ONLY",
+    "VALIDATION_AUTO_GPU_RESIDENT_VRAM_GIB",
     "VALIDATION_INFERENCE_MODE_BY_TRAINING_MODE",
+    "VALIDATION_MODEL_CPU_OFFLOAD_POLICIES",
     "PilotBatchPrimitiveControls",
     "PilotQFormerCheckpointPaths",
     "PilotTrainingRuntimeSpec",
@@ -731,8 +866,10 @@ __all__ = [
     "resolve_pilot_qformer_checkpoint_paths",
     "resolve_pilot_training_runtime",
     "resolve_training_spec",
+    "resolve_validation_enable_model_cpu_offload",
     "resolve_validation_inference_mode",
     "save_pilot_qformer_checkpoint",
+    "should_skip_gate_loss",
     "split_pilot_qformer_state_dict",
     "update_controlled_validation_metadata",
     "validate_pilot_qformer_checkpoint_metadata",

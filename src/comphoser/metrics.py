@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 import math
-from typing import Mapping
+import threading
+from typing import Any, Mapping
 
 import numpy as np
 from PIL import Image
+
+
+# LPIPS model cache. Loaded lazily on first compute_lpips call, reused across all
+# subsequent calls. Keyed on (net, device_str) so periodic validation and the
+# standalone evaluator share a single in-process model. The lock guards the
+# first-load race in case validation fires concurrently.
+_LPIPS_MODEL_CACHE: dict[tuple[str, str], Any] = {}
+_LPIPS_LOAD_LOCK = threading.Lock()
 
 
 def image_to_rgb_array(image: Image.Image) -> np.ndarray:
@@ -29,14 +38,31 @@ def validate_same_image_shape(output_image: Image.Image, target_image: Image.Ima
 
 def compute_psnr_db(output_image: Image.Image, target_image: Image.Image) -> float:
     output_array, target_array = _paired_rgb_arrays(output_image, target_image, metric_name="PSNR")
-    mse = float(np.mean(np.square(output_array - target_array), dtype=np.float64))
+    # Difference in float64 to avoid float32 round-off in the squared error (R36).
+    diff = output_array.astype(np.float64) - target_array.astype(np.float64)
+    mse = float(np.mean(np.square(diff), dtype=np.float64))
     if mse == 0.0:
         return 100.0
     return float(20.0 * math.log10(255.0) - 10.0 * math.log10(mse))
 
 
+# SSIM Gaussian local-statistics window, matched to scikit-image
+# `structural_similarity(..., gaussian_weights=True, sigma=1.5)`:
+# scipy's gaussian_filter uses radius = int(truncate*sigma + 0.5) = 5, i.e. an
+# 11x11 window. scikit-image discards a `radius`-pixel border from the SSIM map
+# before averaging (`crop`); we do the same so numbers are comparable to the
+# de-facto reference implementation (R03).
+_SSIM_GAUSSIAN_SIGMA = 1.5
+_SSIM_GAUSSIAN_TRUNCATE = 3.5
+_SSIM_GAUSSIAN_RADIUS = int(_SSIM_GAUSSIAN_TRUNCATE * _SSIM_GAUSSIAN_SIGMA + 0.5)
+
+
 def compute_ssim(output_image: Image.Image, target_image: Image.Image) -> float:
-    """Compute mean RGB SSIM using the standard 11x11 Gaussian local statistics window."""
+    """Mean RGB SSIM over an 11x11 Gaussian window, scikit-image-comparable.
+
+    Uses sigma=1.5 / truncate=3.5 Gaussian local statistics (an 11x11 window) and
+    crops the `radius`-pixel border from the SSIM map before averaging, matching
+    `skimage.metrics.structural_similarity(gaussian_weights=True, sigma=1.5)`."""
 
     output_array, target_array = _paired_rgb_arrays(output_image, target_image, metric_name="SSIM")
     x = output_array.astype(np.float64)
@@ -44,6 +70,7 @@ def compute_ssim(output_image: Image.Image, target_image: Image.Image) -> float:
 
     c1 = (0.01 * 255.0) ** 2
     c2 = (0.03 * 255.0) ** 2
+    radius = _SSIM_GAUSSIAN_RADIUS
     channel_scores = []
     for channel in range(3):
         x_channel = x[..., channel]
@@ -60,7 +87,11 @@ def compute_ssim(output_image: Image.Image, target_image: Image.Image) -> float:
 
         numerator = (2.0 * mu_xy + c1) * (2.0 * sigma_xy + c2)
         denominator = (mu_x_sq + mu_y_sq + c1) * (sigma_x_sq + sigma_y_sq + c2)
-        channel_scores.append(float(np.mean(numerator / denominator, dtype=np.float64)))
+        ssim_map = numerator / denominator
+        # Discard the Gaussian border (skimage `crop`) when the image is large enough.
+        if ssim_map.shape[0] > 2 * radius and ssim_map.shape[1] > 2 * radius:
+            ssim_map = ssim_map[radius:-radius, radius:-radius]
+        channel_scores.append(float(np.mean(ssim_map, dtype=np.float64)))
     return float(np.mean(channel_scores, dtype=np.float64))
 
 
@@ -71,11 +102,75 @@ def compute_delta_e_2000(output_image: Image.Image, target_image: Image.Image) -
     return float(np.mean(ciede2000(output_lab, target_lab), dtype=np.float64))
 
 
+_LPIPS_MIN_SPATIAL_DIM = 64
+
+
+def compute_lpips(
+    output_image: Image.Image,
+    target_image: Image.Image,
+    *,
+    net: str = "alex",
+    device: str | None = None,
+) -> float:
+    """LPIPS perceptual distance (lower = more similar). Uses the standalone `lpips`
+    package with the AlexNet backbone by default. Model weights are lazily loaded
+    and cached per (net, device).
+
+    Inputs smaller than 64 px on either spatial dimension are bilinearly upsampled
+    before being fed to the network (AlexNet's five pool layers would otherwise
+    collapse the feature map to zero spatial extent)."""
+
+    import torch
+    import torch.nn.functional as F
+
+    output_array, target_array = _paired_rgb_arrays(output_image, target_image, metric_name="LPIPS")
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = _get_lpips_model(net=net, device=device)
+
+    def _to_tensor(arr: np.ndarray) -> Any:
+        # LPIPS expects shape (B, 3, H, W) with values in [-1, 1].
+        scaled = (arr.astype(np.float32) / 127.5) - 1.0
+        tensor = torch.from_numpy(scaled).permute(2, 0, 1).unsqueeze(0)
+        return tensor.to(device)
+
+    output_tensor = _to_tensor(output_array)
+    target_tensor = _to_tensor(target_array)
+
+    if min(output_tensor.shape[-2:]) < _LPIPS_MIN_SPATIAL_DIM:
+        size = _LPIPS_MIN_SPATIAL_DIM
+        output_tensor = F.interpolate(output_tensor, size=(size, size), mode="bilinear", align_corners=False)
+        target_tensor = F.interpolate(target_tensor, size=(size, size), mode="bilinear", align_corners=False)
+
+    with torch.no_grad():
+        score = model(output_tensor, target_tensor)
+    return float(score.item())
+
+
+def _get_lpips_model(*, net: str, device: str) -> Any:
+    key = (net, device)
+    if key in _LPIPS_MODEL_CACHE:
+        return _LPIPS_MODEL_CACHE[key]
+    with _LPIPS_LOAD_LOCK:
+        if key in _LPIPS_MODEL_CACHE:
+            return _LPIPS_MODEL_CACHE[key]
+        import lpips
+
+        model = lpips.LPIPS(net=net, verbose=False).to(device)
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
+        _LPIPS_MODEL_CACHE[key] = model
+        return model
+
+
 def compute_image_metrics(output_image: Image.Image, target_image: Image.Image) -> dict[str, float]:
     return {
         "psnr_db": compute_psnr_db(output_image, target_image),
         "ssim": compute_ssim(output_image, target_image),
         "delta_e_2000": compute_delta_e_2000(output_image, target_image),
+        "lpips_alex": compute_lpips(output_image, target_image),
     }
 
 
@@ -84,6 +179,7 @@ def unavailable_image_metrics() -> dict[str, None]:
         "psnr_db": None,
         "ssim": None,
         "delta_e_2000": None,
+        "lpips_alex": None,
     }
 
 
@@ -92,6 +188,7 @@ def image_metric_units() -> Mapping[str, str]:
         "psnr_db": "dB",
         "ssim": "unitless",
         "delta_e_2000": "delta_e",
+        "lpips_alex": "unitless",
     }
 
 
@@ -197,12 +294,16 @@ def _paired_rgb_arrays(
 
 
 def _gaussian_filter_2d(values: np.ndarray) -> np.ndarray:
+    # scipy is required for SSIM. Previously a bare `except Exception: return values`
+    # silently turned SSIM into ungated local statistics (~0.69/~1.0 garbage) on any
+    # failure; narrow to ImportError and fail loudly so SSIM is never silently wrong (R03).
     try:
         from scipy.ndimage import gaussian_filter
-
-        return gaussian_filter(values, sigma=1.5, truncate=3.5, mode="reflect")
-    except Exception:
-        return values
+    except ImportError as exc:  # pragma: no cover - exercised only without scipy installed
+        raise ImportError(
+            "compute_ssim requires scipy (scipy.ndimage.gaussian_filter). Install scipy to compute SSIM."
+        ) from exc
+    return gaussian_filter(values, sigma=_SSIM_GAUSSIAN_SIGMA, truncate=_SSIM_GAUSSIAN_TRUNCATE, mode="reflect")
 
 
 def _hue_angle_degrees(b_values: np.ndarray, a_values: np.ndarray) -> np.ndarray:
@@ -214,6 +315,7 @@ __all__ = [
     "ciede2000",
     "compute_delta_e_2000",
     "compute_image_metrics",
+    "compute_lpips",
     "compute_psnr_db",
     "compute_ssim",
     "image_metric_units",

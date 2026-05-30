@@ -23,8 +23,6 @@ DEFAULT_QFORMER_QUERY_COUNT = PILOT_TOTAL_QUERY_COUNT
 DEFAULT_QFORMER_COND_SUMMARY_TOKENS = 4
 DEFAULT_QFORMER_NUM_LAYERS = 3
 QFORMER_CONTROLLER_LAYOUT_PROMPT_ROUTER_V2 = "fixed_global_query_bank_prompt_router_v2"
-QFORMER_RUNTIME_GATE_MODE_PREDICTED_ONLY = "predicted_only"
-QFORMER_RUNTIME_GATE_MODE_TARGET_MASKED = "target_masked"
 
 
 @dataclass(frozen=True)
@@ -167,8 +165,12 @@ class ComPhoserQFormer(nn.Module):
         for layer in self.extra_trunk_layers:
             prompt_context = layer(prompt_context)
         query_bank = self.query_bank.unsqueeze(0).expand(batch_size, -1, -1)
+        normalized_query_bank = self.query_norm(query_bank)
         attended_context, _ = self.query_attention(query_bank, prompt_context, prompt_context, need_weights=False)
-        raw_query_gates = self.gate_head(attended_context + query_bank).squeeze(-1)
+        # Use the LayerNorm'd bank in the gate-head residual so the gate predictor sees the same
+        # normalized representation that is appended to the conditioning sequence below; previously
+        # this added the raw `query_bank`, whose scale drifts as the bank trains (A1 / R08).
+        raw_query_gates = self.gate_head(attended_context + normalized_query_bank).squeeze(-1)
 
         predicted_query_gates = torch.sigmoid(raw_query_gates)
         normalized_override = _normalize_explicit_token_masking(
@@ -178,7 +180,7 @@ class ComPhoserQFormer(nn.Module):
             dtype=predicted_query_gates.dtype,
         )
         query_gates = predicted_query_gates if normalized_override is None else normalized_override
-        query_group = self.query_norm(query_bank) * query_gates.unsqueeze(-1)
+        query_group = normalized_query_bank * query_gates.unsqueeze(-1)
 
         return ComPhoserQFormerOutput(
             query_group=query_group,
@@ -498,8 +500,6 @@ __all__ = [
     "DEFAULT_QFORMER_QUERY_COUNT",
     "DEFAULT_QFORMER_TASK_ID",
     "QFORMER_CONTROLLER_LAYOUT_PROMPT_ROUTER_V2",
-    "QFORMER_RUNTIME_GATE_MODE_PREDICTED_ONLY",
-    "QFORMER_RUNTIME_GATE_MODE_TARGET_MASKED",
     "append_query_tokens_to_prompt",
     "build_batch_query_gate_target_mask",
     "build_query_gate_target_mask",

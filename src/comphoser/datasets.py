@@ -245,6 +245,12 @@ class MultiPreparedPilotDataset(Dataset):
             for dataset in self.datasets
             for record in dataset.repeated_records
         )
+        # Per-row child-dataset (== folder) index, used by UniformFolderSampler.
+        self.dataset_index_labels = tuple(
+            dataset_index
+            for dataset_index, dataset in enumerate(self.datasets)
+            for _ in range(len(dataset))
+        )
 
         for dataset in self.datasets[1:]:
             if dataset.backend != self.backend:
@@ -268,8 +274,68 @@ class MultiPreparedPilotDataset(Dataset):
         return self.datasets[dataset_index][local_index]
 
 
+class IdentityWrapper(Dataset):
+    """Adapter that turns a prepared dataset into an identity-training source.
+
+    For each row fetched from the wrapped dataset, the **input** (cond) is
+    replaced with the **target** (instance). Used by Stage 1 (consistency
+    preservation) of the step-by-step training strategy: input = target
+    teaches the model + controller to produce ≈ input when asked to do nothing.
+
+    The wrapper passes through every attribute that the trainer and samplers
+    expect (``buckets``, ``bucket_indices``, ``primitive_group_labels``,
+    ``dataset_index_labels``, ``uses_preprocessed_backend``, etc.), so it can
+    be plugged into ``UniformFolderSampler`` and the trainer's existing data
+    path without further changes.
+
+    Stage 1 prompt mixing (empty vs preserve) is **not** done here — it is
+    decided per batch in the training loop and broadcast via precomputed
+    prompt embeddings. ``IdentityWrapper`` only handles the image side.
+    """
+
+    _PASSTHROUGH_ATTRS = (
+        "backend",
+        "size",
+        "center_crop",
+        "random_flip",
+        "uses_preprocessed_backend",
+        "uses_raw_backend",
+        "dataset_ids",
+        "record_sources",
+        "record_source",
+        "records",
+        "custom_instance_prompts",
+        "buckets",
+        "bucket_indices",
+        "primitive_group_labels",
+        "dataset_index_labels",
+    )
+
+    def __init__(self, base_dataset: PreparedPilotDataset | MultiPreparedPilotDataset) -> None:
+        self.base = base_dataset
+        for attr in self._PASSTHROUGH_ATTRS:
+            if hasattr(base_dataset, attr):
+                setattr(self, attr, getattr(base_dataset, attr))
+        # Ensure dataset_index_labels exists even for a single PreparedPilotDataset.
+        if not hasattr(self, "dataset_index_labels"):
+            self.dataset_index_labels = tuple(0 for _ in range(len(base_dataset)))
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        row = dict(self.base[index])
+        # Copy the target side onto the conditioning side (input = target).
+        if "instance_latents" in row:
+            row["cond_latents"] = row["instance_latents"]
+        if "instance_images" in row:
+            row["cond_images"] = row["instance_images"]
+        row["stage1_identity"] = True
+        return row
+
+
 class BucketBatchSampler(BatchSampler):
-    def __init__(self, dataset: Dataset, batch_size: int, drop_last: bool = False):
+    def __init__(self, dataset: Dataset, batch_size: int, drop_last: bool = False, *, seed: int = 0):
         if not isinstance(batch_size, int) or batch_size <= 0:
             raise ValueError(f"batch_size should be a positive integer value, but got batch_size={batch_size}")
         if not isinstance(drop_last, bool):
@@ -278,6 +344,11 @@ class BucketBatchSampler(BatchSampler):
         self.dataset = dataset
         self.batch_size = batch_size
         self.drop_last = drop_last
+        # Deterministic, seeded shuffling keyed on (seed + epoch). Previously this sampler
+        # used the unseeded module-global `random`, so Stage-3 / single_dataset runs could
+        # not be reproduced and replayed the same order every epoch (R06).
+        self.seed = int(seed)
+        self._epoch = 0
 
         self.bucket_indices = [[] for _ in range(len(self.dataset.buckets))]
         if hasattr(self.dataset, "bucket_indices"):
@@ -290,20 +361,34 @@ class BucketBatchSampler(BatchSampler):
         for idx, bucket_idx in enumerate(dataset_bucket_indices):
             self.bucket_indices[bucket_idx].append(idx)
 
+        # Batch count is independent of shuffling, so __len__ stays stable across epochs.
         self.sampler_len = 0
-        self.batches: list[list[int]] = []
         for indices_in_bucket in self.bucket_indices:
-            random.shuffle(indices_in_bucket)
-            for i in range(0, len(indices_in_bucket), self.batch_size):
-                batch = indices_in_bucket[i : i + self.batch_size]
-                if len(batch) < self.batch_size and self.drop_last:
-                    continue
-                self.batches.append(batch)
-                self.sampler_len += 1
+            count = len(indices_in_bucket)
+            if self.drop_last:
+                self.sampler_len += count // self.batch_size
+            else:
+                self.sampler_len += (count + self.batch_size - 1) // self.batch_size
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch so resumed runs reproduce the ordering of an uninterrupted run."""
+
+        self._epoch = int(epoch)
 
     def __iter__(self):
-        random.shuffle(self.batches)
-        for batch in self.batches:
+        rng = random.Random(self.seed + self._epoch)
+        batches: list[list[int]] = []
+        for indices_in_bucket in self.bucket_indices:
+            shuffled = list(indices_in_bucket)
+            rng.shuffle(shuffled)
+            for i in range(0, len(shuffled), self.batch_size):
+                batch = shuffled[i : i + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                batches.append(batch)
+        rng.shuffle(batches)
+        self._epoch += 1
+        for batch in batches:
             yield batch
 
     def __len__(self):
@@ -311,7 +396,19 @@ class BucketBatchSampler(BatchSampler):
 
 
 class PrimitiveGroupBalancedBucketBatchSampler(BatchSampler):
-    """Yield same-bucket batches while balancing primitive-group frequency exactly."""
+    """Yield same-bucket batches while balancing primitive-group frequency exactly.
+
+    Default behavior (``dataset_uniform_within_group=False``): rows within a
+    selected group are pooled across all of that group's datasets, so larger
+    datasets get more probability mass within their group.
+
+    ``dataset_uniform_within_group=True``: for each group's batch slot, a
+    dataset is first chosen *uniformly* from the datasets registered to that
+    group, then rows are sampled within that dataset's bucket. This is the
+    Stage 2 (multi-task primitive learning) sampling policy and matches the
+    user's "dataset-uniform within group" choice from the design memo.
+    Requires the dataset to expose ``dataset_index_labels``.
+    """
 
     def __init__(
         self,
@@ -320,6 +417,7 @@ class PrimitiveGroupBalancedBucketBatchSampler(BatchSampler):
         drop_last: bool = False,
         *,
         seed: int = 0,
+        dataset_uniform_within_group: bool = False,
     ) -> None:
         if not isinstance(batch_size, int) or batch_size <= 0:
             raise ValueError(f"batch_size should be a positive integer value, but got batch_size={batch_size}")
@@ -334,35 +432,100 @@ class PrimitiveGroupBalancedBucketBatchSampler(BatchSampler):
                 "PrimitiveGroupBalancedBucketBatchSampler requires the dataset to expose "
                 "primitive_group_labels, bucket_indices, and buckets"
             )
+        if dataset_uniform_within_group:
+            dataset_index_labels = getattr(dataset, "dataset_index_labels", None)
+            if dataset_index_labels is None:
+                raise AttributeError(
+                    "dataset_uniform_within_group=True requires the dataset to expose dataset_index_labels"
+                )
+        else:
+            dataset_index_labels = None
 
         self.dataset = dataset
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.seed = int(seed)
+        self.dataset_uniform_within_group = bool(dataset_uniform_within_group)
         self._epoch = 0
 
-        group_to_bucket_indices: dict[str, dict[int, list[int]]] = {}
-        for index, (primitive_group, bucket_idx) in enumerate(zip(primitive_group_labels, bucket_indices)):
-            if primitive_group is None:
+        # Nested structure depends on the sampling policy:
+        # - dataset_uniform_within_group=False: group -> bucket_idx -> indices
+        # - dataset_uniform_within_group=True:  group -> dataset_idx -> bucket_idx -> indices
+        if dataset_uniform_within_group:
+            group_to_dataset_to_bucket: dict[str, dict[int, dict[int, list[int]]]] = {}
+            for index, (primitive_group, bucket_idx, dataset_idx) in enumerate(
+                zip(primitive_group_labels, bucket_indices, dataset_index_labels)
+            ):
+                if not primitive_group:
+                    raise ValueError(
+                        "PrimitiveGroupBalancedBucketBatchSampler requires every row to expose a non-empty "
+                        "primitive-family label. Rows from non-catalog folders (e.g. downstream_*) carry an "
+                        "empty family and are only valid under --training_strategy=all_in_one or single_dataset, "
+                        "not the group-balanced Stage 2 sampler."
+                    )
+                group_to_dataset_to_bucket.setdefault(str(primitive_group), {}).setdefault(
+                    int(dataset_idx), {}
+                ).setdefault(int(bucket_idx), []).append(index)
+            if not group_to_dataset_to_bucket:
                 raise ValueError(
-                    "PrimitiveGroupBalancedBucketBatchSampler requires every row to expose a primitive-family label"
+                    "PrimitiveGroupBalancedBucketBatchSampler requires at least one non-empty primitive group"
                 )
-            group_to_bucket_indices.setdefault(str(primitive_group), {}).setdefault(int(bucket_idx), []).append(index)
-
-        if not group_to_bucket_indices:
-            raise ValueError("PrimitiveGroupBalancedBucketBatchSampler requires at least one non-empty primitive group")
-
-        self.primitive_groups = tuple(
-            sorted(group_to_bucket_indices, key=lambda group: PILOT_PRIMITIVE_FAMILY_ORDER.index(group))
-        )
-        self.group_to_bucket_indices = {
-            primitive_group: {
-                bucket_idx: tuple(indices)
-                for bucket_idx, indices in sorted(bucket_map.items())
-                if indices
+            self.primitive_groups = tuple(
+                sorted(group_to_dataset_to_bucket, key=lambda group: PILOT_PRIMITIVE_FAMILY_ORDER.index(group))
+            )
+            self.group_to_dataset_to_bucket = {
+                primitive_group: {
+                    dataset_idx: {
+                        bucket_idx: tuple(indices)
+                        for bucket_idx, indices in sorted(bucket_map.items())
+                        if indices
+                    }
+                    for dataset_idx, bucket_map in sorted(dataset_map.items())
+                }
+                for primitive_group, dataset_map in group_to_dataset_to_bucket.items()
             }
-            for primitive_group, bucket_map in group_to_bucket_indices.items()
-        }
+            # Flatten to also keep a per-group bucket view for batch-count math.
+            self.group_to_bucket_indices = {
+                primitive_group: {
+                    bucket_idx: tuple(
+                        idx
+                        for dataset_map_inner in dataset_map.values()
+                        for idx in dataset_map_inner.get(bucket_idx, ())
+                    )
+                    for bucket_idx in sorted(
+                        {b for dataset_map_inner in dataset_map.values() for b in dataset_map_inner.keys()}
+                    )
+                }
+                for primitive_group, dataset_map in self.group_to_dataset_to_bucket.items()
+            }
+        else:
+            group_to_bucket_indices: dict[str, dict[int, list[int]]] = {}
+            for index, (primitive_group, bucket_idx) in enumerate(zip(primitive_group_labels, bucket_indices)):
+                if not primitive_group:
+                    raise ValueError(
+                        "PrimitiveGroupBalancedBucketBatchSampler requires every row to expose a non-empty "
+                        "primitive-family label. Rows from non-catalog folders (e.g. downstream_*) carry an "
+                        "empty family and are only valid under --training_strategy=all_in_one or single_dataset, "
+                        "not the group-balanced Stage 2 sampler."
+                    )
+                group_to_bucket_indices.setdefault(str(primitive_group), {}).setdefault(int(bucket_idx), []).append(index)
+            if not group_to_bucket_indices:
+                raise ValueError(
+                    "PrimitiveGroupBalancedBucketBatchSampler requires at least one non-empty primitive group"
+                )
+            self.primitive_groups = tuple(
+                sorted(group_to_bucket_indices, key=lambda group: PILOT_PRIMITIVE_FAMILY_ORDER.index(group))
+            )
+            self.group_to_bucket_indices = {
+                primitive_group: {
+                    bucket_idx: tuple(indices)
+                    for bucket_idx, indices in sorted(bucket_map.items())
+                    if indices
+                }
+                for primitive_group, bucket_map in group_to_bucket_indices.items()
+            }
+            self.group_to_dataset_to_bucket = None
+
         self.group_counts = {
             primitive_group: sum(len(indices) for indices in bucket_map.values())
             for primitive_group, bucket_map in self.group_to_bucket_indices.items()
@@ -373,6 +536,11 @@ class PrimitiveGroupBalancedBucketBatchSampler(BatchSampler):
         )
         self.sampler_len = self.target_batches_per_group * len(self.primitive_groups)
 
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch so resumed runs reproduce the ordering of an uninterrupted run (R06)."""
+
+        self._epoch = int(epoch)
+
     def __iter__(self):
         rng = random.Random(self.seed + self._epoch)
         group_schedule = [
@@ -382,22 +550,37 @@ class PrimitiveGroupBalancedBucketBatchSampler(BatchSampler):
         ]
         rng.shuffle(group_schedule)
 
-        bucket_state = {
-            primitive_group: {
-                bucket_idx: self._new_bucket_cycle(indices, rng)
-                for bucket_idx, indices in bucket_map.items()
+        if self.dataset_uniform_within_group:
+            bucket_state = {
+                primitive_group: {
+                    dataset_idx: {
+                        bucket_idx: self._new_bucket_cycle(indices, rng)
+                        for bucket_idx, indices in bucket_map.items()
+                    }
+                    for dataset_idx, bucket_map in dataset_map.items()
+                }
+                for primitive_group, dataset_map in self.group_to_dataset_to_bucket.items()
             }
-            for primitive_group, bucket_map in self.group_to_bucket_indices.items()
-        }
+        else:
+            bucket_state = {
+                primitive_group: {
+                    bucket_idx: self._new_bucket_cycle(indices, rng)
+                    for bucket_idx, indices in bucket_map.items()
+                }
+                for primitive_group, bucket_map in self.group_to_bucket_indices.items()
+            }
 
         for primitive_group in group_schedule:
-            bucket_idx = self._sample_bucket_index(primitive_group, rng)
-            batch = self._draw_batch(
-                primitive_group=primitive_group,
-                bucket_idx=bucket_idx,
-                bucket_state=bucket_state,
-                rng=rng,
-            )
+            if self.dataset_uniform_within_group:
+                batch = self._draw_dataset_uniform_batch(primitive_group, bucket_state, rng)
+            else:
+                bucket_idx = self._sample_bucket_index(primitive_group, rng)
+                batch = self._draw_batch(
+                    primitive_group=primitive_group,
+                    bucket_idx=bucket_idx,
+                    bucket_state=bucket_state,
+                    rng=rng,
+                )
             if len(batch) < self.batch_size and self.drop_last:
                 continue
             yield batch
@@ -427,6 +610,175 @@ class PrimitiveGroupBalancedBucketBatchSampler(BatchSampler):
         rng: random.Random,
     ) -> list[int]:
         state = bucket_state[primitive_group][bucket_idx]
+        batch: list[int] = []
+        while len(batch) < self.batch_size:
+            if state["position"] >= len(state["indices"]):
+                state.update(self._new_bucket_cycle(state["source_indices"], rng))
+            batch.append(state["indices"][state["position"]])
+            state["position"] += 1
+        return batch
+
+    def _draw_dataset_uniform_batch(
+        self,
+        primitive_group: str,
+        bucket_state: dict[str, dict[int, dict[int, dict[str, Any]]]],
+        rng: random.Random,
+    ) -> list[int]:
+        dataset_map = self.group_to_dataset_to_bucket[primitive_group]
+        dataset_idx = rng.choice(tuple(dataset_map))
+        bucket_map = dataset_map[dataset_idx]
+        bucket_indices_list = tuple(bucket_map)
+        bucket_weights = [len(bucket_map[bucket_idx]) for bucket_idx in bucket_indices_list]
+        bucket_idx = rng.choices(bucket_indices_list, weights=bucket_weights, k=1)[0]
+        state = bucket_state[primitive_group][dataset_idx][bucket_idx]
+        batch: list[int] = []
+        while len(batch) < self.batch_size:
+            if state["position"] >= len(state["indices"]):
+                state.update(self._new_bucket_cycle(state["source_indices"], rng))
+            batch.append(state["indices"][state["position"]])
+            state["position"] += 1
+        return batch
+
+    @staticmethod
+    def _new_bucket_cycle(indices: Sequence[int], rng: random.Random) -> dict[str, Any]:
+        shuffled_indices = list(indices)
+        rng.shuffle(shuffled_indices)
+        return {
+            "indices": tuple(shuffled_indices),
+            "position": 0,
+            "source_indices": tuple(indices),
+        }
+
+
+class UniformFolderSampler(BatchSampler):
+    """Yield same-bucket batches with **each folder weighted equally** per epoch.
+
+    Used by ``--training_strategy=all_in_one`` and by Stage 1 of step-by-step:
+    every child dataset (folder) gets the same number of batches per epoch
+    regardless of its size or its primitive group. Within a sampled folder,
+    rows are drawn at random (respecting bucket grouping).
+
+    Requires the dataset to expose ``dataset_index_labels``, ``bucket_indices``,
+    and ``buckets`` — ``MultiPreparedPilotDataset`` provides all three.
+    A single-folder ``PreparedPilotDataset`` is also accepted (degenerates to
+    standard bucket-aware random sampling).
+    """
+
+    def __init__(
+        self,
+        dataset: PreparedPilotDataset | MultiPreparedPilotDataset,
+        batch_size: int,
+        drop_last: bool = False,
+        *,
+        seed: int = 0,
+    ) -> None:
+        if not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError(f"batch_size should be a positive integer value, but got batch_size={batch_size}")
+        if not isinstance(drop_last, bool):
+            raise ValueError(f"drop_last should be a boolean value, but got drop_last={drop_last}")
+
+        dataset_index_labels = getattr(dataset, "dataset_index_labels", None)
+        bucket_indices = getattr(dataset, "bucket_indices", None)
+        buckets = getattr(dataset, "buckets", None)
+        if bucket_indices is None or buckets is None:
+            raise AttributeError(
+                "UniformFolderSampler requires the dataset to expose bucket_indices and buckets"
+            )
+        if dataset_index_labels is None:
+            # Single PreparedPilotDataset → treat as one folder.
+            dataset_index_labels = tuple(0 for _ in range(len(dataset)))
+
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.seed = int(seed)
+        self._epoch = 0
+
+        folder_to_bucket_indices: dict[int, dict[int, list[int]]] = {}
+        for index, (folder_id, bucket_idx) in enumerate(zip(dataset_index_labels, bucket_indices)):
+            folder_to_bucket_indices.setdefault(int(folder_id), {}).setdefault(int(bucket_idx), []).append(index)
+
+        if not folder_to_bucket_indices:
+            raise ValueError("UniformFolderSampler requires at least one non-empty folder")
+
+        self.folder_ids = tuple(sorted(folder_to_bucket_indices))
+        self.folder_to_bucket_indices = {
+            folder_id: {
+                bucket_idx: tuple(indices)
+                for bucket_idx, indices in sorted(bucket_map.items())
+                if indices
+            }
+            for folder_id, bucket_map in folder_to_bucket_indices.items()
+        }
+        self.folder_counts = {
+            folder_id: sum(len(indices) for indices in bucket_map.values())
+            for folder_id, bucket_map in self.folder_to_bucket_indices.items()
+        }
+        self.target_batches_per_folder = max(
+            max(1, self._batch_count_for_folder(folder_count))
+            for folder_count in self.folder_counts.values()
+        )
+        self.sampler_len = self.target_batches_per_folder * len(self.folder_ids)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch so resumed runs reproduce the ordering of an uninterrupted run (R06)."""
+
+        self._epoch = int(epoch)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self._epoch)
+        folder_schedule = [
+            folder_id
+            for folder_id in self.folder_ids
+            for _ in range(self.target_batches_per_folder)
+        ]
+        rng.shuffle(folder_schedule)
+
+        bucket_state = {
+            folder_id: {
+                bucket_idx: self._new_bucket_cycle(indices, rng)
+                for bucket_idx, indices in bucket_map.items()
+            }
+            for folder_id, bucket_map in self.folder_to_bucket_indices.items()
+        }
+
+        for folder_id in folder_schedule:
+            bucket_idx = self._sample_bucket_index(folder_id, rng)
+            batch = self._draw_batch(
+                folder_id=folder_id,
+                bucket_idx=bucket_idx,
+                bucket_state=bucket_state,
+                rng=rng,
+            )
+            if len(batch) < self.batch_size and self.drop_last:
+                continue
+            yield batch
+
+        self._epoch += 1
+
+    def __len__(self) -> int:
+        return self.sampler_len
+
+    def _batch_count_for_folder(self, folder_count: int) -> int:
+        if self.drop_last:
+            return folder_count // self.batch_size
+        return (folder_count + self.batch_size - 1) // self.batch_size
+
+    def _sample_bucket_index(self, folder_id: int, rng: random.Random) -> int:
+        bucket_map = self.folder_to_bucket_indices[folder_id]
+        bucket_indices = tuple(bucket_map)
+        bucket_weights = [len(bucket_map[bucket_idx]) for bucket_idx in bucket_indices]
+        return rng.choices(bucket_indices, weights=bucket_weights, k=1)[0]
+
+    def _draw_batch(
+        self,
+        *,
+        folder_id: int,
+        bucket_idx: int,
+        bucket_state: dict[int, dict[int, dict[str, Any]]],
+        rng: random.Random,
+    ) -> list[int]:
+        state = bucket_state[folder_id][bucket_idx]
         batch: list[int] = []
         while len(batch) < self.batch_size:
             if state["position"] >= len(state["indices"]):
@@ -840,10 +1192,16 @@ def _resolve_contract_runtime_spec(dataset_root: Path) -> dict[str, str]:
     dataset_name = dataset_root.name
     try:
         task_spec = get_task_spec_for_dataset_id(dataset_name)
-    except KeyError as error:
-        raise NotImplementedError(
-            f"Automatic prepared/runtime derivation is not implemented for dataset root '{dataset_name}'."
-        ) from error
+    except KeyError:
+        # Non-catalog folder (e.g. downstream_*); the family-catalog gate in
+        # discover_dataset_task_specs filtered it out. Fall back to using the folder
+        # name as the task_id with no primitive family. Callers that rely on the
+        # family (BCE gate loss) must already be in a skip_gate_loss strategy
+        # (step_by_step_stage3 / single_dataset for downstream targets).
+        return {
+            "task_id": dataset_name,
+            "primitive_family": "",
+        }
     return {
         "task_id": task_spec.task_id,
         "primitive_family": task_spec.primitive_group,
@@ -975,10 +1333,12 @@ __all__ = [
     "PREPARED_PRIMITIVE_METADATA_FILENAME",
     "PREPARED_RECORD_SOURCE_DERIVED_CONTRACT",
     "PREPARED_RECORD_SOURCE_MANIFEST",
+    "IdentityWrapper",
     "PrimitiveGroupBalancedBucketBatchSampler",
     "PreparedPilotDataset",
     "PreparedPilotDatasetMetadata",
     "PreparedPilotRecord",
+    "UniformFolderSampler",
     "collate_prepared_pilot_examples",
     "find_nearest_bucket",
     "load_prepared_pilot_dataset_metadata",

@@ -7,8 +7,10 @@ import os
 from typing import Sequence
 
 from .datasets import COMPHOSER_DATA_BACKENDS
+from .inference import DEFAULT_CONTROLLED_VALIDATION_STEPS
 from .qformer import DEFAULT_QFORMER_NUM_LAYERS, DEFAULT_QFORMER_QUERY_COUNT
 from .training import PILOT_GATE_LOSS_WEIGHT_SCHEDULERS, PILOT_TRAINING_MODES
+
 
 COMPHOSER_VALIDATION_MODES = ("batch", "single", "off")
 
@@ -176,6 +178,84 @@ def build_parser() -> argparse.ArgumentParser:
         choices=PILOT_GATE_LOSS_WEIGHT_SCHEDULERS,
         help="Scheduler mode for interpolating the auxiliary gate-loss weight across optimizer steps.",
     )
+    parser.add_argument(
+        "--training_strategy",
+        type=str,
+        default=None,
+        choices=(
+            "all_in_one",
+            "step_by_step_stage1",
+            "step_by_step_stage2",
+            "step_by_step_stage3",
+            "single_dataset",
+        ),
+        help=(
+            "Top-level training strategy. Unset (default) keeps the legacy per-group dispatch. "
+            "'all_in_one' samples uniformly across all discovered folders (subject to --comphoser_primitive_groups filter). "
+            "'step_by_step_stage{1,2,3}' runs one stage of the staged curriculum (see docs/architecture/training_strategy.md). "
+            "'single_dataset' trains on the single folder named by --downstream_target_dataset_id."
+        ),
+    )
+    parser.add_argument(
+        "--downstream_target_dataset_id",
+        type=str,
+        default=None,
+        help=(
+            "Required for --training_strategy=step_by_step_stage3 and --training_strategy=single_dataset: "
+            "the dataset_id (folder name) of the single dataset to train on. If the name does not "
+            "match any folder discovered for the selected --comphoser_primitive_groups (e.g. a "
+            "non-catalog 'downstream_*' folder), the trainer falls back to loading data/<name>/ "
+            "directly."
+        ),
+    )
+    parser.add_argument(
+        "--exclude_dataset_ids",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional list of dataset_ids (folder names) to exclude from training after "
+            "auto-discovery and the --comphoser_primitive_groups filter. Useful for ablation "
+            "studies or pretraining phases that should skip specific primitives. Excluding does "
+            "not affect the validation fan-out (which still walks every discovered task). "
+            "Ignored when --train_dataset_ids is set."
+        ),
+    )
+    parser.add_argument(
+        "--train_dataset_ids",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional explicit allow-list of dataset_ids for training. When set it acts as the "
+            "exhaustive training task pool, bypassing --comphoser_primitive_groups and "
+            "--exclude_dataset_ids. Each name is resolved against the discovered catalog first; "
+            "if not found, falls back to loading data/<name>/ directly (lets non-catalog "
+            "downstream_* folders participate). Default unset = use the discovery + exclude path."
+        ),
+    )
+    parser.add_argument(
+        "--validation_dataset_ids",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional explicit allow-list of dataset_ids for the validation fan-out. When set it "
+            "acts as the exhaustive validation task pool, bypassing the default "
+            "(controls.tasks + --downstream_target_dataset_id). Each name is resolved against "
+            "the discovered catalog first; if not found, falls back to data/<name>/. Default "
+            "unset = walk every discovered task plus the downstream target."
+        ),
+    )
+    parser.add_argument(
+        "--stage1_identity_prompt_mix_ratio",
+        type=float,
+        default=0.5,
+        help=(
+            "Stage 1 only: fraction of identity-pretraining samples that use the 'preserve' prompt vs an empty prompt. "
+            "Default 0.5."
+        ),
+    )
     parser.add_argument("--repeats", type=int, default=1, help="How many times to repeat the training data.")
     parser.add_argument(
         "--class_data_dir",
@@ -243,12 +323,61 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--num_validation_inference_steps",
+        type=int,
+        default=DEFAULT_CONTROLLED_VALIDATION_STEPS,
+        help=(
+            "Number of denoising steps for ComPhoser controlled validation (periodic + "
+            "end-of-training). FLUX.2 Klein is guidance-distilled, so fewer steps (e.g. 4) run "
+            "roughly proportionally faster while only affecting validation image fidelity, not "
+            f"the trained weights. Default {DEFAULT_CONTROLLED_VALIDATION_STEPS}."
+        ),
+    )
+    parser.add_argument(
         "--validation_steps",
         type=int,
         default=50,
         help=(
             "Run dreambooth validation every X steps. Dreambooth validation consists of running the prompt "
             "`args.validation_prompt` multiple times: `args.num_validation_images`."
+        ),
+    )
+    parser.add_argument(
+        "--validation_chunk_size",
+        type=int,
+        default=None,
+        help=(
+            "Optional: for periodic ComPhoser validation, restrict each call to this many tasks "
+            "and cycle through the fan-out list across successive validation steps. With N "
+            "discovered tasks and chunk size K, one full rotation covers everything every ceil(N/K) "
+            "validation calls. Default (None / 0 / >= N) = walk every task each periodic call. "
+            "End-of-training validation always walks every task regardless of this flag."
+        ),
+    )
+    parser.add_argument(
+        "--pivotal_validation_dataset_id",
+        type=str,
+        default=None,
+        help=(
+            "Optional dataset_id (folder name) that is always validated on every periodic call. "
+            "Auto-added to the fan-out if not already present (resolved against the discovered "
+            "catalog with fallback to data/<id>/). When --validation_chunk_size=K is also set, "
+            "one slot of each chunk is reserved for the pivotal task and the remaining tasks "
+            "cycle through K-1 slots; with K=1 only the pivotal task runs each periodic call. "
+            "Default unset = no pinned task."
+        ),
+    )
+    parser.add_argument(
+        "--validation_model_cpu_offload",
+        type=str,
+        choices=("auto", "on", "off"),
+        default="auto",
+        help=(
+            "Policy for diffusers' enable_model_cpu_offload() during periodic + "
+            "end-of-training validation. auto (default) skips offload when the validation "
+            "device's total VRAM is >= 48 GiB (FLUX.2 Klein 4B at bf16 peaks ~27 GiB; "
+            "GPU-resident is ~7x faster than offload) and falls back to offload on smaller "
+            "GPUs to avoid OOM. on = always offload. off = always GPU-resident."
         ),
     )
     parser.add_argument(
@@ -270,7 +399,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="flux-dreambooth-lora",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help=(
+            "A seed for reproducible training and validation. Defaults to 42 so runs are deterministic "
+            "out of the box (samplers, augmentation, and validation generators all key off it). Pass an "
+            "explicit value per arm of an A/B comparison."
+        ),
+    )
     parser.add_argument(
         "--resolution",
         type=int,
@@ -340,6 +478,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Whether training should be resumed from a previous checkpoint. Use a path saved by "
             "`--checkpointing_steps`, or `\"latest\"` to automatically select the last available checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--init_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Warm-start from a checkpoint directory: load LoRA + Q-Former weights only, with a fresh "
+            "optimizer, LR scheduler, and global step counter. Distinct from --resume_from_checkpoint "
+            "(which continues mid-training and restores all state). Use this to chain training stages "
+            "(e.g. Stage 2 starting from Stage 1's final checkpoint)."
         ),
     )
     parser.add_argument(
@@ -603,6 +752,8 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
         args.comphoser_gate_loss_weight = float(args.comphoser_gate_loss_weight_initial)
         if args.num_validation_seeds_per_image <= 0:
             raise ValueError("--num_validation_seeds_per_image must be positive")
+        if args.num_validation_inference_steps <= 0:
+            raise ValueError("--num_validation_inference_steps must be positive")
         if args.comphoser_validation_mode == "batch" and args.num_validation_images <= 0:
             raise ValueError("ComPhoser batch validation requires --num_validation_images to be positive")
         if args.comphoser_validation_mode == "single":
@@ -619,6 +770,32 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
 
     if args.distributed_timeout_seconds <= 0:
         raise ValueError("--distributed_timeout_seconds must be positive")
+
+    if args.init_from_checkpoint and args.resume_from_checkpoint:
+        raise ValueError(
+            "--init_from_checkpoint and --resume_from_checkpoint are mutually exclusive. "
+            "Use --init_from_checkpoint for cross-stage warm-start (weights only) and "
+            "--resume_from_checkpoint for in-stage continuation (full state restore)."
+        )
+
+    # --training_strategy related validation
+    if not 0.0 <= args.stage1_identity_prompt_mix_ratio <= 1.0:
+        raise ValueError("--stage1_identity_prompt_mix_ratio must be within [0.0, 1.0]")
+
+    strategies_requiring_target = ("step_by_step_stage3", "single_dataset")
+    if args.training_strategy in strategies_requiring_target and not args.downstream_target_dataset_id:
+        raise ValueError(
+            f"--training_strategy={args.training_strategy} requires --downstream_target_dataset_id "
+            "(the dataset_id of the target folder)"
+        )
+    if (
+        args.downstream_target_dataset_id
+        and args.training_strategy not in strategies_requiring_target
+    ):
+        raise ValueError(
+            "--downstream_target_dataset_id is only valid with "
+            "--training_strategy=step_by_step_stage3 or --training_strategy=single_dataset"
+        )
 
     return args
 

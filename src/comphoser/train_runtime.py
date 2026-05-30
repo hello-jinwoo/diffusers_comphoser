@@ -26,6 +26,7 @@ from .training import (
     build_pilot_prompt_policy_summary,
     build_pilot_qformer_checkpoint_metadata,
     resolve_pilot_training_runtime,
+    resolve_validation_enable_model_cpu_offload,
     resolve_validation_inference_mode,
     save_pilot_qformer_checkpoint,
     update_controlled_validation_metadata,
@@ -118,11 +119,18 @@ def build_detached_validation_pipeline(
 
 
 def resolve_and_log_pilot_training(args: Any, logger: Any):
+    # All-in-one strategy bypasses the catalog filter on the supervision side (no per-
+    # family BCE loss). Tell discovery to surface non-catalog folders too so the trainer
+    # sees every contract folder under data/, not just the primitives.
+    include_non_catalog = getattr(args, "training_strategy", None) == "all_in_one"
     comphoser_training = resolve_pilot_training_runtime(
         args.comphoser_mode,
         primitive_groups=args.comphoser_primitive_groups,
         qformer_num_queries=args.comphoser_qformer_num_queries,
         qformer_num_layers=args.comphoser_qformer_num_layers,
+        exclude_dataset_ids=getattr(args, "exclude_dataset_ids", None),
+        train_dataset_ids=getattr(args, "train_dataset_ids", None),
+        include_non_catalog_in_discovery=include_non_catalog,
     )
     if comphoser_training.uses_prepared_pilot_dataset:
         if args.dataset_name is not None or args.instance_data_dir is not None:
@@ -169,6 +177,7 @@ def build_pilot_checkpoint_metadata(
     train_dataset: PreparedPilotDataset | MultiPreparedPilotDataset,
     qformer: ComPhoserQFormer | None,
     comphoser_training: Any,
+    sampling_policy: str | None = None,
 ) -> dict[str, object] | None:
     if qformer is None:
         return None
@@ -208,10 +217,21 @@ def build_pilot_checkpoint_metadata(
         gate_loss_weight_initial=args.comphoser_gate_loss_weight_initial,
         gate_loss_weight_final=args.comphoser_gate_loss_weight_final,
         gate_loss_weight_scheduler=args.comphoser_gate_loss_weight_scheduler,
+        extra_metadata={
+            "training_strategy": getattr(args, "training_strategy", None),
+            "sampling_policy": sampling_policy,
+            "seed": getattr(args, "seed", None),
+        },
     )
 
 
 def build_comphoser_validation_tracker_payload(summary: Mapping[str, Any]) -> dict[str, float | int]:
+    """Flatten per-task validation summary into wandb-loggable scalars.
+
+    Emits one `validation/<task_id>/<metric>_mean` key per available image metric (PSNR,
+    SSIM, ΔE 2000, LPIPS-Alex).
+    """
+
     task_id = str(summary["task_id"])
     payload: dict[str, float | int] = {}
 
@@ -219,9 +239,10 @@ def build_comphoser_validation_tracker_payload(summary: Mapping[str, Any]) -> di
     if not isinstance(metrics, Mapping):
         return payload
 
-    psnr_summary = metrics.get("psnr_db")
-    if isinstance(psnr_summary, Mapping) and psnr_summary.get("status") == "available":
-        payload[f"validation/{task_id}/psnr_db_mean"] = float(psnr_summary["mean"])
+    for metric_name in ("psnr_db", "ssim", "delta_e_2000", "lpips_alex"):
+        metric_summary = metrics.get(metric_name)
+        if isinstance(metric_summary, Mapping) and metric_summary.get("status") == "available":
+            payload[f"validation/{task_id}/{metric_name}_mean"] = float(metric_summary["mean"])
 
     return payload
 
@@ -378,6 +399,8 @@ def run_comphoser_validation(
     logger: Any,
     validation_mode: str | None = None,
     artifact_subdir: str,
+    chunk_size: int | None = None,
+    chunk_index: int = 0,
 ) -> tuple[tuple[Path, dict[str, Any]], ...] | None:
     if args.comphoser_validation_mode == "off":
         return None
@@ -386,20 +409,112 @@ def run_comphoser_validation(
 
     resolved_validation_mode = validation_mode or resolve_validation_inference_mode(comphoser_training.mode)
     if args.comphoser_validation_mode == "batch":
+        # Build the fan-out task list. When --validation_dataset_ids is set it acts as an
+        # exhaustive allow-list (bypassing the family-filter / exclude / downstream-append
+        # logic). Otherwise default = every task the runtime is actually training on (catalog
+        # primitives plus any non-catalog folders surfaced via --training_strategy=all_in_one
+        # or --train_dataset_ids), plus the downstream target if Stage 3 / single_dataset is
+        # training on a non-catalog folder loaded via the direct-load fallback.
+        from .controls import resolve_dataset_task_spec_by_id
+
+        explicit_validation_ids = getattr(args, "validation_dataset_ids", None)
+        if explicit_validation_ids:
+            fanout = []
+            for name in dict.fromkeys(str(item) for item in explicit_validation_ids if item):
+                spec = resolve_dataset_task_spec_by_id(name)
+                fanout.append((spec.dataset_root, spec.task_id, spec.dataset_id))
+        else:
+            # training_task_specs reflects the actual training task pool — catalog primitives
+            # plus any non-catalog folders surfaced by --training_strategy=all_in_one or by an
+            # explicit --train_dataset_ids list. Fall back to controls.tasks for the legacy
+            # runtime spec shape (and for the baseline mode which has no training tasks here).
+            training_tasks = getattr(comphoser_training, "training_task_specs", None) or (
+                comphoser_training.training_spec.controls.tasks
+            )
+            fanout = [
+                (task_spec.dataset_root, task_spec.task_id, task_spec.dataset_id)
+                for task_spec in training_tasks
+            ]
+            downstream_target = getattr(args, "downstream_target_dataset_id", None)
+            if downstream_target and downstream_target not in {entry[2] for entry in fanout}:
+                downstream_root = Path("data") / downstream_target
+                if downstream_root.is_dir():
+                    fanout.append((downstream_root, downstream_target, downstream_target))
+
+        # Pivotal task: always validated on every call. Auto-added to the fan-out if it isn't
+        # already present (resolved via the discovery catalog, falling back to data/<id>/).
+        pivotal_dataset_id = getattr(args, "pivotal_validation_dataset_id", None)
+        pivotal_entry: tuple | None = None
+        if pivotal_dataset_id:
+            for entry in fanout:
+                if entry[2] == pivotal_dataset_id:
+                    pivotal_entry = entry
+                    break
+            if pivotal_entry is None:
+                spec = resolve_dataset_task_spec_by_id(pivotal_dataset_id)
+                pivotal_entry = (spec.dataset_root, spec.task_id, spec.dataset_id)
+                fanout.append(pivotal_entry)
+
+        # Cyclic chunking: when chunk_size is set (typically only during periodic validation),
+        # take a contiguous slice of `fanout` of length chunk_size starting at chunk_index *
+        # chunk_size (modulo the number of chunks). This spreads validation cost across calls
+        # so each periodic step only validates a subset while still covering everything over
+        # one full rotation. With a pivotal task set, one slot per chunk is reserved for it and
+        # the remaining tasks cycle through chunk_size - 1 slots; with chunk_size=1 only the
+        # pivotal runs each call.
+        if chunk_size is not None and chunk_size > 0 and chunk_size < len(fanout) and fanout:
+            if pivotal_entry is not None:
+                non_pivotal = [entry for entry in fanout if entry[2] != pivotal_dataset_id]
+                if chunk_size == 1 or not non_pivotal:
+                    non_pivotal_chunk: list[tuple] = []
+                    num_chunks = 1
+                    selected = 0
+                else:
+                    effective_chunk_size = chunk_size - 1
+                    num_chunks = (len(non_pivotal) + effective_chunk_size - 1) // effective_chunk_size
+                    selected = chunk_index % num_chunks
+                    start = selected * effective_chunk_size
+                    stop = min(start + effective_chunk_size, len(non_pivotal))
+                    non_pivotal_chunk = non_pivotal[start:stop]
+                fanout = [pivotal_entry, *non_pivotal_chunk]
+                logger.info(
+                    "Cyclic validation chunk %d/%d (size=%d, pivotal=%s): tasks %s",
+                    selected + 1,
+                    num_chunks,
+                    len(fanout),
+                    pivotal_dataset_id,
+                    [entry[2] for entry in fanout],
+                )
+            else:
+                num_chunks = (len(fanout) + chunk_size - 1) // chunk_size
+                selected = chunk_index % num_chunks
+                start = selected * chunk_size
+                stop = min(start + chunk_size, len(fanout))
+                logger.info(
+                    "Cyclic validation chunk %d/%d (size=%d): tasks %s",
+                    selected + 1,
+                    num_chunks,
+                    stop - start,
+                    [entry[2] for entry in fanout[start:stop]],
+                )
+                fanout = fanout[start:stop]
+
         results = []
-        for task_spec in comphoser_training.training_spec.controls.tasks:
-            task_artifact_subdir = str(Path(artifact_subdir) / task_spec.dataset_id)
+        for dataset_root, task_id, dataset_id in fanout:
+            task_artifact_subdir = str(Path(artifact_subdir) / dataset_id)
             summary_path, summary = save_controlled_validation_artifacts(
                 output_dir,
                 pipelines_by_mode=pipelines_by_mode,
-                records=load_prepared_pilot_records(task_spec.dataset_root, split="val"),
-                task_id=task_spec.task_id,
+                records=load_prepared_pilot_records(dataset_root, split="val"),
+                task_id=task_id,
                 qformer=qformer,
                 seed=args.seed,
                 validation_mode=resolved_validation_mode,
                 sample_limit=args.num_validation_images,
                 num_outputs_per_sample=args.num_validation_seeds_per_image,
-                num_inference_steps=DEFAULT_CONTROLLED_VALIDATION_STEPS,
+                num_inference_steps=getattr(
+                    args, "num_validation_inference_steps", DEFAULT_CONTROLLED_VALIDATION_STEPS
+                ),
                 guidance_scale=args.guidance_scale,
                 height=args.resolution,
                 width=args.resolution,
@@ -408,7 +523,7 @@ def run_comphoser_validation(
             )
             logger.info(
                 "Saved ComPhoser validation artifacts for task %s to %s",
-                task_spec.task_id,
+                task_id,
                 Path(summary_path).parent,
             )
             results.append((summary_path, summary))
@@ -442,7 +557,9 @@ def run_comphoser_validation(
             seed=args.seed,
             validation_mode=resolved_validation_mode,
             num_outputs_per_sample=args.num_validation_seeds_per_image,
-            num_inference_steps=DEFAULT_CONTROLLED_VALIDATION_STEPS,
+            num_inference_steps=getattr(
+                args, "num_validation_inference_steps", DEFAULT_CONTROLLED_VALIDATION_STEPS
+            ),
             guidance_scale=args.guidance_scale,
             height=args.resolution,
             width=args.resolution,
@@ -493,8 +610,31 @@ def run_final_comphoser_export(
         variant=args.variant,
         torch_dtype=weight_dtype,
     )
-    lora_pipeline.load_lora_weights(args.output_dir)
-    lora_pipeline.enable_model_cpu_offload()
+    downstream_lora_path = Path(args.output_dir) / "pytorch_lora_weights_downstream.safetensors"
+    if downstream_lora_path.is_file():
+        # Stage 3: load both the frozen Stage 1+2 LoRA ("default") and the new "downstream"
+        # adapter, then activate them additively for validation inference.
+        lora_pipeline.load_lora_weights(
+            args.output_dir,
+            weight_name="pytorch_lora_weights.safetensors",
+            adapter_name="default",
+        )
+        lora_pipeline.load_lora_weights(
+            args.output_dir,
+            weight_name="pytorch_lora_weights_downstream.safetensors",
+            adapter_name="downstream",
+        )
+        lora_pipeline.set_adapters(["default", "downstream"], adapter_weights=[1.0, 1.0])
+    else:
+        lora_pipeline.load_lora_weights(args.output_dir)
+    final_export_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if resolve_validation_enable_model_cpu_offload(
+        getattr(args, "validation_model_cpu_offload", "auto"),
+        final_export_device,
+    ):
+        lora_pipeline.enable_model_cpu_offload()
+    else:
+        lora_pipeline.to(final_export_device)
     lora_pipeline.set_progress_bar_config(disable=True)
 
     validation_results = run_comphoser_validation(

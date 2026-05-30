@@ -270,6 +270,7 @@ install_requires = [
     deps["requests"],
     deps["safetensors"],
     deps["Pillow"],
+    "lpips",  # perceptual distance metric used by ComPhoser controlled validation
 ]
 
 version_range_max = max(sys.version_info[1], 10) + 1
