@@ -8,7 +8,11 @@ from typing import Sequence
 
 from .datasets import COMPHOSER_DATA_BACKENDS
 from .inference import DEFAULT_CONTROLLED_VALIDATION_STEPS
-from .qformer import DEFAULT_QFORMER_NUM_LAYERS, DEFAULT_QFORMER_QUERY_COUNT
+from .qformer import (
+    DEFAULT_QFORMER_COND_SUMMARY_TOKENS,
+    DEFAULT_QFORMER_NUM_LAYERS,
+    DEFAULT_QFORMER_QUERY_COUNT,
+)
 from .training import PILOT_GATE_LOSS_WEIGHT_SCHEDULERS, PILOT_TRAINING_MODES
 
 
@@ -154,6 +158,75 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--comphoser_qformer_routing_rounds",
+        type=int,
+        default=1,
+        help="Query-routing cross-attention rounds (weight-shared iterative refinement). 1 (default) = single pass.",
+    )
+    parser.add_argument(
+        "--comphoser_qformer_routing_mean_pool",
+        action="store_true",
+        help="Skip query cross-attention for routing; use the mean-pooled prompt context for gate prediction.",
+    )
+    parser.add_argument(
+        "--comphoser_qformer_queries_per_primitive",
+        type=int,
+        default=4,
+        help=(
+            "Query slots per primitive family (4 families). Total query bank = 4 x this. Default 4 (=16 total); "
+            "the query count is derived from this, overriding --comphoser_qformer_num_queries."
+        ),
+    )
+    parser.add_argument(
+        "--comphoser_qformer_routing_dim",
+        type=int,
+        default=0,
+        help=(
+            "Optional routing bottleneck: run the Q-Former routing path (trunk + query attention + "
+            "gate head) at this width instead of hidden_size; the output query bank stays at "
+            "hidden_size. 0 (default) = no bottleneck (full width). Must divide by num_heads."
+        ),
+    )
+    parser.add_argument(
+        "--comphoser_qformer_ffn_multiplier",
+        type=int,
+        default=4,
+        help="Q-Former trunk FFN width multiplier (dim_feedforward = multiplier x routing width). Default 4.",
+    )
+    parser.add_argument(
+        "--comphoser_qformer_gate_head_hidden",
+        type=int,
+        default=0,
+        help="Optional hidden width for a deeper 2-layer gate head (LayerNorm->Linear->GELU->Linear). 0 = default 1-layer head.",
+    )
+    parser.add_argument(
+        "--comphoser_qformer_output_content_mix",
+        action="store_true",
+        help=(
+            "Blend the prompt-attended routing context into the appended output tokens (prompt-adaptive "
+            "content) instead of gating a static bank. No-op at init (learned mix scale starts at 0)."
+        ),
+    )
+    parser.add_argument(
+        "--comphoser_qformer_image_routing",
+        action="store_true",
+        help=(
+            "Enable condition-image-aware Q-Former routing in 'lora_qformer' mode. The image latent "
+            "(cond_tokens) is attention-pooled to a few summary tokens and fed into the gate "
+            "predictor alongside the prompt. Default off keeps the prompt-only v1 controller."
+        ),
+    )
+    parser.add_argument(
+        "--comphoser_qformer_cond_summary_tokens",
+        type=int,
+        default=DEFAULT_QFORMER_COND_SUMMARY_TOKENS,
+        help=(
+            "Number of pooled condition-image summary tokens used when "
+            "--comphoser_qformer_image_routing is set "
+            f"(default {DEFAULT_QFORMER_COND_SUMMARY_TOKENS})."
+        ),
+    )
+    parser.add_argument(
         "--comphoser_gate_loss_weight",
         type=float,
         default=0.1,
@@ -188,12 +261,17 @@ def build_parser() -> argparse.ArgumentParser:
             "step_by_step_stage2",
             "step_by_step_stage3",
             "single_dataset",
+            "downstream",
         ),
         help=(
             "Top-level training strategy. Unset (default) keeps the legacy per-group dispatch. "
             "'all_in_one' samples uniformly across all discovered folders (subject to --comphoser_primitive_groups filter). "
             "'step_by_step_stage{1,2,3}' runs one stage of the staged curriculum (see docs/architecture/training_strategy.md). "
-            "'single_dataset' trains on the single folder named by --downstream_target_dataset_id."
+            "'single_dataset' trains on the single folder named by --downstream_target_dataset_id. "
+            "'downstream' finetunes a NEW additive 'downstream' LoRA on top of the frozen pretrained "
+            "LoRA + Q-Former (warm-started via --init_from_checkpoint, e.g. runs/A_primitives or "
+            "runs/B_stage2_noS1) over the folders named by --downstream_target_dataset_ids; "
+            "--downstream_mode selects integrated (one joint LoRA) vs respective (one LoRA per task)."
         ),
     )
     parser.add_argument(
@@ -205,7 +283,34 @@ def build_parser() -> argparse.ArgumentParser:
             "the dataset_id (folder name) of the single dataset to train on. If the name does not "
             "match any folder discovered for the selected --comphoser_primitive_groups (e.g. a "
             "non-catalog 'downstream_*' folder), the trainer falls back to loading data/<name>/ "
-            "directly."
+            "directly. Also accepted by --training_strategy=downstream as a single-target shorthand "
+            "(equivalent to a one-element --downstream_target_dataset_ids)."
+        ),
+    )
+    parser.add_argument(
+        "--downstream_target_dataset_ids",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Required for --training_strategy=downstream: one or more dataset_ids (folder names, "
+            "typically non-catalog 'downstream_*' folders) to finetune the additive 'downstream' "
+            "LoRA on. With --downstream_mode=integrated a single LoRA is trained jointly over all "
+            "of them (uniform-per-folder sampling); with --downstream_mode=respective the trainer "
+            "loops in-process and trains a separate LoRA per id into <output_dir>/<dataset_id>/. "
+            "Each name is resolved against the discovered catalog first, falling back to data/<name>/."
+        ),
+    )
+    parser.add_argument(
+        "--downstream_mode",
+        type=str,
+        default="integrated",
+        choices=("integrated", "respective"),
+        help=(
+            "Only valid with --training_strategy=downstream. 'integrated' trains ONE additive "
+            "downstream LoRA jointly over every --downstream_target_dataset_ids folder. 'respective' "
+            "trains them one at a time (in-process loop), producing one additive LoRA per task under "
+            "<output_dir>/<dataset_id>/. Default 'integrated'."
         ),
     )
     parser.add_argument(
@@ -477,7 +582,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Whether training should be resumed from a previous checkpoint. Use a path saved by "
-            "`--checkpointing_steps`, or `\"latest\"` to automatically select the last available checkpoint."
+            '`--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
         ),
     )
     parser.add_argument(
@@ -721,17 +826,34 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
         if args.dataset_name is not None and args.instance_data_dir is not None:
             raise ValueError("Specify only one of `--dataset_name` or `--instance_data_dir`")
 
-        if (args.validation_prompt is not None or args.final_validation_prompt is not None) and args.validation_image is None:
-            raise ValueError("Baseline validation requires --validation_image whenever a validation prompt is provided")
+        if (
+            args.validation_prompt is not None or args.final_validation_prompt is not None
+        ) and args.validation_image is None:
+            raise ValueError(
+                "Baseline validation requires --validation_image whenever a validation prompt is provided"
+            )
     else:
         if not args.comphoser_primitive_groups:
             raise ValueError("ComPhoser pilot modes require --comphoser_primitive_groups")
-        if args.comphoser_mode == "lora_qformer" and args.comphoser_qformer_num_queries != DEFAULT_QFORMER_QUERY_COUNT:
+        if args.comphoser_mode == "lora_qformer" and args.comphoser_qformer_queries_per_primitive <= 0:
+            raise ValueError("--comphoser_qformer_queries_per_primitive must be positive in lora_qformer mode")
+        # The query count is derived from queries_per_primitive (4 families x qpf); the legacy fixed-16
+        # requirement only applies at the default qpf=4.
+        if (
+            args.comphoser_mode == "lora_qformer"
+            and args.comphoser_qformer_queries_per_primitive == 4
+            and args.comphoser_qformer_num_queries != DEFAULT_QFORMER_QUERY_COUNT
+        ):
             raise ValueError(
-                f"--comphoser_qformer_num_queries must stay fixed at {DEFAULT_QFORMER_QUERY_COUNT} in lora_qformer mode"
+                f"--comphoser_qformer_num_queries must stay {DEFAULT_QFORMER_QUERY_COUNT} at the default "
+                "queries_per_primitive=4"
             )
         if args.comphoser_mode == "lora_qformer" and args.comphoser_qformer_num_layers <= 0:
             raise ValueError("--comphoser_qformer_num_layers must be positive in lora_qformer mode")
+        if args.comphoser_qformer_image_routing and args.comphoser_mode != "lora_qformer":
+            raise ValueError("--comphoser_qformer_image_routing is only valid in lora_qformer mode")
+        if args.comphoser_mode == "lora_qformer" and args.comphoser_qformer_cond_summary_tokens <= 0:
+            raise ValueError("--comphoser_qformer_cond_summary_tokens must be positive in lora_qformer mode")
         if args.comphoser_gate_loss_weight < 0.0:
             raise ValueError("--comphoser_gate_loss_weight must be non-negative")
         if args.comphoser_gate_loss_weight_initial is None:
@@ -788,13 +910,38 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
             f"--training_strategy={args.training_strategy} requires --downstream_target_dataset_id "
             "(the dataset_id of the target folder)"
         )
-    if (
-        args.downstream_target_dataset_id
-        and args.training_strategy not in strategies_requiring_target
+
+    # --downstream_target_dataset_ids / --downstream_mode are exclusive to the 'downstream' strategy.
+    if args.downstream_target_dataset_ids and args.training_strategy != "downstream":
+        raise ValueError("--downstream_target_dataset_ids is only valid with --training_strategy=downstream")
+
+    if args.training_strategy == "downstream":
+        # Accept either the plural list or the singular shorthand; normalize into the list so
+        # the trainer always reads one canonical, deduped tuple. integrated trains one joint LoRA
+        # over all ids; respective loops over the ids one at a time.
+        combined = list(args.downstream_target_dataset_ids or ())
+        if args.downstream_target_dataset_id:
+            combined.append(args.downstream_target_dataset_id)
+        combined = list(dict.fromkeys(name for name in combined if name))
+        if not combined:
+            raise ValueError(
+                "--training_strategy=downstream requires --downstream_target_dataset_ids "
+                "(one or more folder names) or --downstream_target_dataset_id"
+            )
+        args.downstream_target_dataset_ids = tuple(combined)
+        # The singular field is only meaningful for a one-task run; clear it for multi-task.
+        args.downstream_target_dataset_id = combined[0] if len(combined) == 1 else None
+    else:
+        # Non-downstream strategies never carry a downstream id list.
+        args.downstream_target_dataset_ids = None
+
+    if args.downstream_target_dataset_id and args.training_strategy not in (
+        *strategies_requiring_target,
+        "downstream",
     ):
         raise ValueError(
-            "--downstream_target_dataset_id is only valid with "
-            "--training_strategy=step_by_step_stage3 or --training_strategy=single_dataset"
+            "--downstream_target_dataset_id is only valid with --training_strategy="
+            "step_by_step_stage3, single_dataset, or downstream"
         )
 
     return args

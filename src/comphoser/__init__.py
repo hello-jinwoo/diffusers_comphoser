@@ -21,6 +21,7 @@ _MODULE_EXPORTS = {
 _SYMBOL_EXPORTS = {
     "ComPhoserQFormer": "comphoser.qformer",
     "DEFAULT_PRETRAINED_MODEL_NAME_OR_PATH": "comphoser.evaluation",
+    "DEFAULT_QFORMER_COND_SUMMARY_TOKENS": "comphoser.qformer",
     "DEFAULT_QFORMER_NUM_LAYERS": "comphoser.qformer",
     "DEFAULT_QFORMER_QUERY_COUNT": "comphoser.qformer",
     "EVALUATION_MODES": "comphoser.evaluation",
@@ -33,6 +34,7 @@ _SYMBOL_EXPORTS = {
     "PreparedPilotRecord": "comphoser.datasets",
     "PrimitiveGroupBalancedBucketBatchSampler": "comphoser.datasets",
     "UniformFolderSampler": "comphoser.datasets",
+    "QFORMER_CONTROLLER_LAYOUT_PROMPT_IMAGE_ROUTER_V3": "comphoser.qformer",
     "QFORMER_CONTROLLER_LAYOUT_PROMPT_ROUTER_V2": "comphoser.qformer",
     "VALIDATION_AUTO_GPU_RESIDENT_VRAM_GIB": "comphoser.training",
     "VALIDATION_MODEL_CPU_OFFLOAD_POLICIES": "comphoser.training",

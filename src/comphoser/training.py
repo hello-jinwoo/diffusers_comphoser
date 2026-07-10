@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 import torch
-from safetensors.torch import load_file as load_safetensors_file, save_file as save_safetensors_file
+from safetensors.torch import load_file as load_safetensors_file
+from safetensors.torch import save_file as save_safetensors_file
 from torch import Tensor
 from torch.nn import functional as F
 
@@ -30,12 +31,15 @@ from .controls import (
 )
 from .datasets import PREPARED_RECORD_SOURCE_DERIVED_CONTRACT, PREPARED_RECORD_SOURCE_MANIFEST
 from .qformer import (
+    DEFAULT_QFORMER_COND_SUMMARY_TOKENS,
     DEFAULT_QFORMER_NUM_LAYERS,
     DEFAULT_QFORMER_QUERY_COUNT,
-    ComPhoserQFormer,
+    QFORMER_CONTROLLER_LAYOUT_PROMPT_IMAGE_ROUTER_V3,
     QFORMER_CONTROLLER_LAYOUT_PROMPT_ROUTER_V2,
+    ComPhoserQFormer,
     append_query_tokens_to_prompt,
 )
+
 
 PILOT_GATE_LOSS_WEIGHT_SCHEDULERS = ("linear", "logarithmic", "exponential")
 PILOT_TRAINING_MODES = ("baseline", "lora_only", "lora_qformer")
@@ -71,6 +75,15 @@ class PilotTrainingRuntimeSpec:
     training_task_specs: tuple[PrimitiveTaskSpec, ...] = ()
     qformer_num_queries: int | None = None
     qformer_num_layers: int | None = None
+    qformer_image_routing: bool = False
+    qformer_cond_summary_tokens: int | None = None
+    qformer_routing_dim: int | None = None
+    qformer_ffn_multiplier: int | None = None
+    qformer_gate_head_hidden: int | None = None
+    qformer_output_content_mix: bool = False
+    qformer_queries_per_primitive: int | None = None
+    qformer_routing_rounds: int | None = None
+    qformer_routing_mean_pool: bool = False
 
     @property
     def uses_prepared_pilot_dataset(self) -> bool:
@@ -147,6 +160,15 @@ def resolve_pilot_training_runtime(
     primitive_groups: Sequence[str] | str | None = None,
     qformer_num_queries: int | None = None,
     qformer_num_layers: int | None = None,
+    qformer_image_routing: bool = False,
+    qformer_cond_summary_tokens: int | None = None,
+    qformer_routing_dim: int | None = None,
+    qformer_ffn_multiplier: int | None = None,
+    qformer_gate_head_hidden: int | None = None,
+    qformer_output_content_mix: bool = False,
+    qformer_queries_per_primitive: int | None = None,
+    qformer_routing_rounds: int | None = None,
+    qformer_routing_mean_pool: bool = False,
     metadata_overrides: Mapping[str, Mapping[str, object]] | None = None,
     exclude_dataset_ids: Sequence[str] | None = None,
     train_dataset_ids: Sequence[str] | None = None,
@@ -165,6 +187,15 @@ def resolve_pilot_training_runtime(
             dataset_roots=(),
             qformer_num_queries=None,
             qformer_num_layers=None,
+            qformer_image_routing=False,
+            qformer_cond_summary_tokens=None,
+            qformer_routing_dim=None,
+            qformer_ffn_multiplier=None,
+            qformer_gate_head_hidden=None,
+            qformer_output_content_mix=False,
+            qformer_queries_per_primitive=None,
+            qformer_routing_rounds=None,
+            qformer_routing_mean_pool=False,
         )
 
     training_spec = resolve_training_spec(
@@ -254,8 +285,16 @@ def resolve_pilot_training_runtime(
         resolved_num_layers = DEFAULT_QFORMER_NUM_LAYERS if qformer_num_layers is None else qformer_num_layers
         if resolved_num_layers <= 0:
             raise ValueError("lora_qformer mode requires a positive qformer_num_layers value")
+        resolved_cond_summary_tokens = (
+            DEFAULT_QFORMER_COND_SUMMARY_TOKENS if qformer_cond_summary_tokens is None else qformer_cond_summary_tokens
+        )
+        if resolved_cond_summary_tokens <= 0:
+            raise ValueError("lora_qformer mode requires a positive qformer_cond_summary_tokens value")
+        resolved_image_routing = bool(qformer_image_routing)
     else:
         resolved_num_layers = None
+        resolved_cond_summary_tokens = None
+        resolved_image_routing = False
 
     dataset_roots = tuple(dict.fromkeys(task.dataset_root for task in dataset_tasks))
     # Preserve the actual training-task list (catalog + any non-catalog folders surfaced via
@@ -275,6 +314,25 @@ def resolve_pilot_training_runtime(
         training_task_specs=tuple(deduped_training_tasks),
         qformer_num_queries=qformer_num_queries if run_mode == "lora_qformer" else None,
         qformer_num_layers=resolved_num_layers,
+        qformer_image_routing=resolved_image_routing,
+        qformer_cond_summary_tokens=resolved_cond_summary_tokens,
+        qformer_routing_dim=(int(qformer_routing_dim) if qformer_routing_dim else None)
+        if run_mode == "lora_qformer"
+        else None,
+        qformer_ffn_multiplier=(int(qformer_ffn_multiplier) if qformer_ffn_multiplier else None)
+        if run_mode == "lora_qformer"
+        else None,
+        qformer_gate_head_hidden=(int(qformer_gate_head_hidden) if qformer_gate_head_hidden else None)
+        if run_mode == "lora_qformer"
+        else None,
+        qformer_output_content_mix=bool(qformer_output_content_mix) if run_mode == "lora_qformer" else False,
+        qformer_queries_per_primitive=(int(qformer_queries_per_primitive) if qformer_queries_per_primitive else None)
+        if run_mode == "lora_qformer"
+        else None,
+        qformer_routing_rounds=(int(qformer_routing_rounds) if qformer_routing_rounds else None)
+        if run_mode == "lora_qformer"
+        else None,
+        qformer_routing_mean_pool=bool(qformer_routing_mean_pool) if run_mode == "lora_qformer" else False,
     )
 
 
@@ -317,7 +375,9 @@ def resolve_pilot_batch_primitive_controls(
                 # here only arises from a non-catalog folder under one of those strategies (e.g.
                 # single_dataset on a downstream_* folder), where it pushes every gate toward 0.
                 continue
-            grouped_strengths[task_spec.primitive_group] = max(grouped_strengths.get(task_spec.primitive_group, 0.0), strength)
+            grouped_strengths[task_spec.primitive_group] = max(
+                grouped_strengths.get(task_spec.primitive_group, 0.0), strength
+            )
 
         if len(grouped_strengths) > 1:
             resolved_groups = ", ".join(sorted(grouped_strengths))
@@ -374,16 +434,17 @@ def build_pilot_qformer_auxiliary_loss(
     return F.binary_cross_entropy_with_logits(raw_query_gates.float(), gate_targets.float())
 
 
-_GATE_LOSS_SKIPPING_STRATEGIES = frozenset({"step_by_step_stage1", "all_in_one", "step_by_step_stage3"})
+_GATE_LOSS_SKIPPING_STRATEGIES = frozenset({"step_by_step_stage1", "all_in_one", "step_by_step_stage3", "downstream"})
 
 
 def should_skip_gate_loss(training_strategy: str | None) -> bool:
     """Whether the BCE auxiliary gate loss should be skipped for this training strategy.
 
     Stage 1 trains identity with no per-sample family target, all-in-one treats every task
-    equally without a family concept, and Stage 3 has a frozen Q-Former (any BCE here would
-    just be no-op gradients on frozen params). Other strategies — None (legacy), Stage 2,
-    single_dataset — compute the BCE gate loss normally.
+    equally without a family concept, and the additive-downstream strategies (step_by_step_stage3,
+    downstream) have a frozen Q-Former (any BCE here would just be no-op gradients on frozen
+    params). Other strategies — None (legacy), Stage 2, single_dataset — compute the BCE gate loss
+    normally.
     """
     return training_strategy in _GATE_LOSS_SKIPPING_STRATEGIES
 
@@ -486,9 +547,7 @@ def build_pilot_qformer_checkpoint_metadata(
         num_layers=qformer.num_layers,
         training_dataset_ids=tuple(dict.fromkeys(str(dataset_id) for dataset_id in training_dataset_ids)),
         prompt_policy_summary=dict(prompt_policy_summary),
-        evaluation_summary_pointers=(
-            {"status": "pending", "artifact": CONTROLLED_VALIDATION_METADATA_ARTIFACT},
-        ),
+        evaluation_summary_pointers=({"status": "pending", "artifact": CONTROLLED_VALIDATION_METADATA_ARTIFACT},),
         baseline_comparison_pointers=(
             {
                 "status": "pending",
@@ -502,8 +561,20 @@ def build_pilot_qformer_checkpoint_metadata(
         gate_loss_weight_final=resolved_final_weight,
         gate_loss_weight_scheduler=str(gate_loss_weight_scheduler),
         cond_token_dim=qformer.cond_token_dim,
-        controller_layout=QFORMER_CONTROLLER_LAYOUT_PROMPT_ROUTER_V2,
-        routing_context="prompt_only",
+        cond_summary_tokens=qformer.cond_summary_tokens,
+        routing_dim=qformer.routing_dim,
+        ffn_multiplier=qformer.ffn_multiplier,
+        gate_head_hidden=qformer.gate_head_hidden,
+        output_content_mix=qformer.output_content_mix,
+        routing_rounds=qformer.routing_rounds,
+        routing_mean_pool=qformer.routing_mean_pool,
+        image_routing=qformer.image_routing,
+        controller_layout=(
+            QFORMER_CONTROLLER_LAYOUT_PROMPT_IMAGE_ROUTER_V3
+            if qformer.image_routing
+            else QFORMER_CONTROLLER_LAYOUT_PROMPT_ROUTER_V2
+        ),
+        routing_context="prompt_image" if qformer.image_routing else "prompt_only",
         # Run-provenance fields (training_strategy / sampling_policy / seed). Recorded so a
         # checkpoint alone identifies which strategy + config produced it (R13). These are
         # additive — not in PILOT_CHECKPOINT_METADATA_FIELDS — so legacy checkpoints still load.
@@ -526,9 +597,7 @@ def resolve_pilot_qformer_checkpoint_paths(output_dir: str | Path) -> PilotQForm
 def has_pilot_qformer_checkpoint(output_dir: str | Path) -> bool:
     paths = resolve_pilot_qformer_checkpoint_paths(output_dir)
     return (
-        paths.shared_qformer_path.is_file()
-        and paths.task_query_bank_path.is_file()
-        and paths.metadata_path.is_file()
+        paths.shared_qformer_path.is_file() and paths.task_query_bank_path.is_file() and paths.metadata_path.is_file()
     )
 
 
@@ -655,6 +724,21 @@ def validate_pilot_qformer_checkpoint_metadata(
             f"qformer.num_layers {qformer.num_layers}"
         )
 
+    # Legacy (v1/v2) checkpoints predate image-aware routing; absence means prompt-only.
+    resolved_image_routing = bool(metadata.get("image_routing", False))
+    if resolved_image_routing != qformer.image_routing:
+        raise ValueError(
+            f"Checkpoint metadata image_routing {resolved_image_routing} does not match instantiated "
+            f"qformer.image_routing {qformer.image_routing}"
+        )
+
+    cond_summary_tokens = metadata.get("cond_summary_tokens")
+    if cond_summary_tokens is not None and int(cond_summary_tokens) != qformer.cond_summary_tokens:
+        raise ValueError(
+            f"Checkpoint metadata cond_summary_tokens {cond_summary_tokens} does not match instantiated "
+            f"qformer.cond_summary_tokens {qformer.cond_summary_tokens}"
+        )
+
 
 def update_controlled_validation_metadata(
     summary_path: str | Path,
@@ -750,9 +834,7 @@ def resolve_validation_enable_model_cpu_offload(
 
     if policy not in VALIDATION_MODEL_CPU_OFFLOAD_POLICIES:
         supported = ", ".join(VALIDATION_MODEL_CPU_OFFLOAD_POLICIES)
-        raise ValueError(
-            f"Unsupported validation_model_cpu_offload policy '{policy}'. Expected one of: {supported}"
-        )
+        raise ValueError(f"Unsupported validation_model_cpu_offload policy '{policy}'. Expected one of: {supported}")
     if policy == "on":
         return True
     if policy == "off":
@@ -795,7 +877,12 @@ def prepare_pilot_transformer_conditioning(
     *,
     qformer: ComPhoserQFormer | None,
     primitive_groups: Sequence[Sequence[str] | str] | Sequence[str] | str | None = None,
-    primitive_strengths: Sequence[Sequence[float] | float] | Sequence[float] | Mapping[str, float] | Tensor | float | None = None,
+    primitive_strengths: Sequence[Sequence[float] | float]
+    | Sequence[float]
+    | Mapping[str, float]
+    | Tensor
+    | float
+    | None = None,
     explicit_token_masking: Sequence[float] | Tensor | None = None,
 ) -> PilotTransformerConditioning:
     if qformer is None:

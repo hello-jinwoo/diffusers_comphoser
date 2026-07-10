@@ -90,11 +90,12 @@ from comphoser.train_runtime import (
     build_detached_validation_qformer,
     build_pilot_checkpoint_metadata,
     build_pilot_qformer,
+    build_qformer_validation_task_summary,
     build_unified_qformer_validation_summary,
     resolve_and_log_pilot_training,
     run_comphoser_validation,
     run_final_comphoser_export,
-    save_unified_qformer_validation_distribution,
+    save_qformer_validation_distribution,
 )
 from comphoser.training import (
     PILOT_PRIMITIVE_FAMILY_ORDER,
@@ -292,16 +293,40 @@ def log_validation(
 
 def _log_comphoser_validation_results(accelerator, validation_results, *, step):
     # Per-task contact sheets are written to disk by save_controlled_validation_artifacts
-    # but are NOT uploaded to wandb (too noisy for the dashboard). The unified Q-Former
-    # gate-distribution PNG is both saved locally and uploaded to wandb so routing
-    # behavior is visible at a glance.
+    # but are NOT uploaded to wandb (too noisy for the dashboard). The Q-Former
+    # gate-distribution PNG and gate accuracy/loss scalars are reported PER TASK (one chart
+    # + one scalar pair per validated task) so routing behavior is visible without averaging
+    # different tasks' gates together. Cross-task averaged scalars are retained alongside.
     if not validation_results:
         return
 
     scalar_payload = {}
-    for _summary_path, summary in validation_results:
+    gate_distribution_images = {}
+    for summary_path, summary in validation_results:
         scalar_payload.update(build_comphoser_validation_tracker_payload(summary))
 
+        task_summary = build_qformer_validation_task_summary(summary_path, summary)
+        task_id = task_summary.get("task_id")
+        if not task_id:
+            continue
+
+        task_accuracy_pct = task_summary.get("average_accuracy_pct")
+        if task_accuracy_pct is not None:
+            scalar_payload[f"validation/{task_id}/qformer_gate_accuracy_pct"] = float(task_accuracy_pct)
+        task_loss = task_summary.get("average_loss")
+        if task_loss is not None:
+            scalar_payload[f"validation/{task_id}/qformer_gate_loss"] = float(task_loss)
+
+        # The PNG is always written to disk; only the wandb upload is gated on availability.
+        distribution_path = save_qformer_validation_distribution(summary_path, task_summary)
+        if distribution_path is not None and distribution_path.is_file() and is_wandb_available():
+            gate_distribution_images[f"validation/{task_id}/qformer_gate_distribution"] = wandb.Image(
+                str(distribution_path),
+                caption=f"{task_id} validation Q-Former gate distribution",
+            )
+
+    # Cross-task averages (sample-weighted mean over every validated output, not a mean of
+    # the per-task means) are kept under the unprefixed keys for dashboard backwards-compat.
     unified_qformer_summary = build_unified_qformer_validation_summary(validation_results)
     average_accuracy_pct = unified_qformer_summary.get("average_accuracy_pct")
     if average_accuracy_pct is not None:
@@ -313,22 +338,12 @@ def _log_comphoser_validation_results(accelerator, validation_results, *, step):
     if scalar_payload:
         accelerator.log(scalar_payload, step=step)
 
-    distribution_path = save_unified_qformer_validation_distribution(validation_results, unified_qformer_summary)
-
-    if distribution_path is None or not distribution_path.is_file() or not is_wandb_available():
+    if not gate_distribution_images:
         return
     for tracker in accelerator.trackers:
         if tracker.name != "wandb":
             continue
-        tracker.log(
-            {
-                "validation/qformer_gate_distribution": wandb.Image(
-                    str(distribution_path),
-                    caption="Unified validation Q-Former gate distribution",
-                ),
-            },
-            step=step,
-        )
+        tracker.log(gate_distribution_images, step=step)
 
 
 def module_filter_fn(mod: torch.nn.Module, fqn: str):
@@ -663,6 +678,18 @@ def main(args):
     if args.seed is not None:
         set_seed(args.seed)
 
+    # The `downstream` strategy expresses its training pool via --downstream_target_dataset_ids.
+    # Feed that into the standard explicit-allow-list (--train_dataset_ids) resolution so the
+    # runtime builds dataset_roots + the validation fan-out over exactly those (typically
+    # non-catalog 'downstream_*') folders. For --downstream_mode=respective, run_with_args has
+    # already narrowed downstream_target_dataset_ids to a single id for this per-task session.
+    if (
+        getattr(args, "training_strategy", None) == "downstream"
+        and not getattr(args, "train_dataset_ids", None)
+        and getattr(args, "downstream_target_dataset_ids", None)
+    ):
+        args.train_dataset_ids = list(args.downstream_target_dataset_ids)
+
     comphoser_training = resolve_and_log_pilot_training(args, logger)
 
     # Handle the repository creation
@@ -803,12 +830,16 @@ def main(args):
         init_lora_weights="gaussian",
         target_modules=target_modules,
     )
-    # Stage 3 (step_by_step_stage3) trains a NEW LoRA adapter ("downstream") on top of the
-    # frozen Stage 1+2 LoRA ("default") + frozen Q-Former. Both adapters are attached up
-    # front so the optimizer (built below) sees the trainable set correctly; the freeze of
-    # "default" + Q-Former happens right after this block.
-    is_stage3 = getattr(args, "training_strategy", None) == "step_by_step_stage3"
-    if is_stage3:
+    # The additive-downstream strategies (step_by_step_stage3 and the unified `downstream`
+    # strategy) train a NEW LoRA adapter ("downstream") on top of the frozen pretrained LoRA
+    # ("default", warm-started via --init_from_checkpoint) + frozen Q-Former. Both adapters are
+    # attached up front so the optimizer (built below) sees the trainable set correctly; the
+    # freeze of "default" + Q-Former happens right after this block.
+    is_additive_downstream = getattr(args, "training_strategy", None) in (
+        "step_by_step_stage3",
+        "downstream",
+    )
+    if is_additive_downstream:
         transformer.add_adapter(transformer_lora_config, adapter_name="default")
         transformer.add_adapter(transformer_lora_config, adapter_name="downstream")
         transformer.set_adapters(["default", "downstream"], weights=[1.0, 1.0])
@@ -819,14 +850,15 @@ def main(args):
         comphoser_training=comphoser_training,
         logger=logger,
     )
-    if is_stage3:
+    if is_additive_downstream:
         for name, param in transformer.named_parameters():
             if "lora_" in name and ".default." in name:
                 param.requires_grad = False
         if qformer is not None:
             qformer.requires_grad_(False)
         logger.info(
-            "Stage 3: 'default' LoRA adapter and Q-Former are frozen; only 'downstream' is trainable."
+            "Additive downstream finetune: 'default' LoRA adapter and Q-Former are frozen; "
+            "only 'downstream' is trainable."
         )
 
     def unwrap_model(model):
@@ -886,9 +918,9 @@ def main(args):
             ):
                 weights.pop(weight_index)
 
-            if is_stage3:
-                # Stage 3 has two LoRA adapters; "default" is frozen but we still serialize it
-                # so the checkpoint dir is self-contained for inference.
+            if is_additive_downstream:
+                # Additive-downstream runs have two LoRA adapters; "default" is frozen but we
+                # still serialize it so the checkpoint dir is self-contained for inference.
                 base_transformer = unwrap_model(transformer_model) if is_fsdp else transformer_model
                 default_layers = get_peft_model_state_dict(
                     base_transformer, adapter_name="default", **peft_kwargs
@@ -953,7 +985,7 @@ def main(args):
                 args.pretrained_model_name_or_path,
                 subfolder="transformer",
             )
-            if is_stage3:
+            if is_additive_downstream:
                 transformer_.add_adapter(transformer_lora_config, adapter_name="default")
                 transformer_.add_adapter(transformer_lora_config, adapter_name="downstream")
                 transformer_.set_adapters(["default", "downstream"], weights=[1.0, 1.0])
@@ -969,7 +1001,7 @@ def main(args):
         }
         transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
         incompatible_keys = set_peft_model_state_dict(transformer_, transformer_state_dict, adapter_name="default")
-        if is_stage3:
+        if is_additive_downstream:
             downstream_state_dict = Flux2KleinPipeline.lora_state_dict(
                 input_dir, weight_name="pytorch_lora_weights_downstream.safetensors"
             )
@@ -1208,6 +1240,24 @@ def main(args):
                 seed=args.seed or 0,
             )
             sampling_policy = "uniform_folder"
+        elif strategy == "downstream":
+            # Additive downstream finetune. The training pool is the --downstream_target_dataset_ids
+            # folders (resolved into dataset_roots above). integrated runs see a multi-root dataset
+            # and weight each downstream task equally per epoch; respective runs (and a single-task
+            # integrated run) collapse to one folder and use plain bucket sampling.
+            if isinstance(train_dataset, MultiPreparedPilotDataset):
+                batch_sampler = UniformFolderSampler(
+                    train_dataset,
+                    batch_size=args.train_batch_size,
+                    drop_last=True,
+                    seed=args.seed or 0,
+                )
+                sampling_policy = "downstream_uniform_folder"
+            else:
+                batch_sampler = BucketBatchSampler(
+                    train_dataset, batch_size=args.train_batch_size, drop_last=True, seed=args.seed or 0
+                )
+                sampling_policy = "downstream_single_folder"
         elif isinstance(train_dataset, MultiPreparedPilotDataset):
             batch_sampler = PrimitiveGroupBalancedBucketBatchSampler(
                 train_dataset,
@@ -1595,8 +1645,9 @@ def main(args):
     def build_validation_transformer_lora_state_dict(
         *,
         fsdp_state_dict: dict[str, Any] | None = None,
+        adapter_name: str = "default",
     ) -> dict[str, Any]:
-        peft_kwargs = {}
+        peft_kwargs: dict[str, Any] = {"adapter_name": adapter_name}
         if fsdp_state_dict is not None:
             peft_kwargs["state_dict"] = fsdp_state_dict
         return {
@@ -1621,12 +1672,10 @@ def main(args):
     periodic_validation_chunk_state = {"index": 0}
 
     def run_periodic_validation(step_index: int) -> None:
-        # Stage 3 trains a second LoRA adapter; the periodic-validation pipeline path
-        # (build_detached_validation_pipeline) is single-adapter only, so periodic validation
-        # would produce wrong results. End-of-training validation (run_final_comphoser_export)
-        # loads both adapters correctly and stays enabled.
-        if getattr(args, "training_strategy", None) == "step_by_step_stage3":
-            return
+        # The additive-downstream strategies (step_by_step_stage3 / downstream) train a second
+        # LoRA adapter on top of the frozen "default" one. The detached validation pipeline loads
+        # both adapters additively (downstream_lora_state_dict below), matching the deployed
+        # inference path and run_final_comphoser_export.
         should_run_validation = (
             args.validation_steps is not None
             and args.validation_steps > 0
@@ -1646,11 +1695,18 @@ def main(args):
             return
 
         validation_transformer_lora_state_dict = None
+        validation_downstream_lora_state_dict = None
         validation_qformer_state_dict = None
         if is_fsdp:
+            fsdp_transformer_state_dict = accelerator.get_state_dict(transformer)
             validation_transformer_lora_state_dict = build_validation_transformer_lora_state_dict(
-                fsdp_state_dict=accelerator.get_state_dict(transformer),
+                fsdp_state_dict=fsdp_transformer_state_dict,
             )
+            if is_additive_downstream:
+                validation_downstream_lora_state_dict = build_validation_transformer_lora_state_dict(
+                    fsdp_state_dict=fsdp_transformer_state_dict,
+                    adapter_name="downstream",
+                )
             if qformer is not None:
                 validation_qformer_state_dict = build_validation_qformer_state_dict(
                     fsdp_state_dict=accelerator.get_state_dict(qformer),
@@ -1661,6 +1717,10 @@ def main(args):
             if comphoser_training.uses_prepared_pilot_dataset:
                 if validation_transformer_lora_state_dict is None:
                     validation_transformer_lora_state_dict = build_validation_transformer_lora_state_dict()
+                if is_additive_downstream and validation_downstream_lora_state_dict is None:
+                    validation_downstream_lora_state_dict = build_validation_transformer_lora_state_dict(
+                        adapter_name="downstream",
+                    )
                 validation_qformer = None
                 if qformer is not None:
                     if validation_qformer_state_dict is None:
@@ -1680,6 +1740,7 @@ def main(args):
                     torch_dtype=weight_dtype,
                     transformer_lora_config=transformer_lora_config,
                     transformer_lora_state_dict=validation_transformer_lora_state_dict,
+                    downstream_lora_state_dict=validation_downstream_lora_state_dict,
                     include_text_encoder=True,
                     enable_model_cpu_offload=periodic_offload_enabled,
                     logger=logger,
@@ -1743,7 +1804,7 @@ def main(args):
         if qformer is not None:
             # Stage 3 freezes the Q-Former (requires_grad=False); keep it in eval mode for
             # consistency with that intent. Other strategies still train it.
-            if is_stage3:
+            if is_additive_downstream:
                 qformer.eval()
             else:
                 qformer.train()
@@ -2014,13 +2075,14 @@ def main(args):
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             if qformer is not None:
                 logs["image_loss"] = image_loss.detach().item()
-                # Distinguish "gate loss skipped/not computed" from a genuine 0.0: log NaN +
-                # a 0/1 computed flag rather than coercing the skipped case to 0.0 (R30).
+                # Distinguish "gate loss skipped/not computed" from a genuine 0.0: omit the key
+                # and log a 0/1 computed flag rather than coercing the skipped case to 0.0 (R30).
+                # (Previously logged NaN, which littered the wandb chart — ~25% of Stage 2 steps
+                # are identity-only batches — and made healthy runs look diverged.)
                 if gate_loss is not None:
                     logs["qformer_gate_loss"] = gate_loss.detach().item()
                     logs["qformer_gate_loss_computed"] = 1.0
                 else:
-                    logs["qformer_gate_loss"] = float("nan")
                     logs["qformer_gate_loss_computed"] = 0.0
                 logs["qformer_gate_loss_weight"] = float(current_gate_loss_weight or 0.0)
             progress_bar.set_postfix(**logs)
@@ -2068,8 +2130,9 @@ def main(args):
 
         modules_to_save["transformer"] = transformer
 
-        if is_stage3:
-            # Stage 3 final save: write both adapters into the output dir so it's self-contained.
+        if is_additive_downstream:
+            # Additive-downstream final save: write both adapters into the output dir so it's
+            # self-contained.
             base_transformer = unwrap_model(transformer) if not is_fsdp else transformer
             peft_kwargs_final = {"state_dict": state_dict} if is_fsdp else {}
             default_layers = get_peft_model_state_dict(
@@ -2204,7 +2267,61 @@ def main(args):
     accelerator.end_training()
 
 
+def plan_downstream_respective_runs(args: Any) -> list[tuple[str, str]]:
+    """Resolve the ordered ``(dataset_id, output_dir)`` pairs for a respective downstream run.
+
+    ``--training_strategy=downstream --downstream_mode=respective`` trains a separate additive
+    downstream LoRA per target. Each task writes a self-contained checkpoint into
+    ``<output_dir>/<dataset_id>/`` so the per-task LoRAs never collide. Ids are deduplicated while
+    preserving the order they were given. Raises ``ValueError`` if called for any other
+    strategy/mode or when no target ids are present.
+    """
+    if getattr(args, "training_strategy", None) != "downstream":
+        raise ValueError("plan_downstream_respective_runs requires --training_strategy=downstream")
+    if getattr(args, "downstream_mode", None) != "respective":
+        raise ValueError("plan_downstream_respective_runs requires --downstream_mode=respective")
+    dataset_ids = tuple(
+        dict.fromkeys(
+            str(name)
+            for name in (getattr(args, "downstream_target_dataset_ids", None) or ())
+            if name
+        )
+    )
+    if not dataset_ids:
+        raise ValueError(
+            "--downstream_mode=respective requires at least one --downstream_target_dataset_ids"
+        )
+    base_output_dir = args.output_dir
+    return [(dataset_id, os.path.join(base_output_dir, dataset_id)) for dataset_id in dataset_ids]
+
+
 def run_with_args(args: Any) -> int:
+    # Respective downstream finetune: a single CLI invocation trains one additive LoRA per task,
+    # re-initializing the model/optimizer for each (heavier but fully isolated). The Accelerator's
+    # global state persists across main() calls, so each task gets fresh trackers/models while the
+    # process group stays up; free_memory() between tasks releases the previous task's weights.
+    if (
+        getattr(args, "training_strategy", None) == "downstream"
+        and getattr(args, "downstream_mode", None) == "respective"
+    ):
+        runs = plan_downstream_respective_runs(args)
+        for index, (dataset_id, task_output_dir) in enumerate(runs):
+            task_args = copy.deepcopy(args)
+            task_args.downstream_target_dataset_ids = (dataset_id,)
+            task_args.downstream_target_dataset_id = dataset_id
+            task_args.train_dataset_ids = [dataset_id]
+            task_args.output_dir = task_output_dir
+            logger.info(
+                "Downstream respective run %d/%d: dataset_id=%s output_dir=%s",
+                index + 1,
+                len(runs),
+                dataset_id,
+                task_output_dir,
+            )
+            main(task_args)
+            free_memory()
+        return 0
+
     main(args)
     return 0
 

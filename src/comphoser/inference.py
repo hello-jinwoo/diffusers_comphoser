@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack
 import json
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -13,12 +13,17 @@ import torch
 from PIL import Image
 from torch import Tensor
 
-from .controls import PILOT_PRIMITIVE_FAMILY_ORDER, PILOT_QUERIES_PER_PRIMITIVE, ResolvedPrimitiveSelection, resolve_control_selection
+from .controls import (
+    PILOT_PRIMITIVE_FAMILY_ORDER,
+    ResolvedPrimitiveSelection,
+    resolve_control_selection,
+)
 from .datasets import PreparedPilotRecord
 from .image_utils import load_rgb_image, save_rgb_image
 from .metrics import compute_image_metrics, image_metric_units, unavailable_image_metrics
 from .qformer import ComPhoserQFormer
 from .training import build_pilot_qformer_auxiliary_loss, prepare_pilot_transformer_conditioning
+
 
 CONTROLLED_VALIDATION_COMPARISON_MODES = ("flux_only", "lora_only", "lora_qformer")
 CONTROLLED_VALIDATION_ARTIFACT_SUBDIR = "controlled_validation"
@@ -245,9 +250,7 @@ def prepare_pilot_inference_conditioning(
         raw_query_gates=conditioning.raw_query_gates,
         predicted_query_gates=conditioning.predicted_query_gates,
         query_gates=conditioning.query_gates,
-        explicit_token_masking=None
-        if explicit_token_masking is None
-        else conditioning.query_gates,
+        explicit_token_masking=None if explicit_token_masking is None else conditioning.query_gates,
         explicit_token_masking_applied=explicit_token_masking is not None,
     )
 
@@ -373,7 +376,9 @@ def save_validation_artifacts(
     )
 
     output_root = Path(output_dir).expanduser().resolve()
-    artifact_dir = output_root / "comphoser" / artifact_subdir if nest_under_comphoser else output_root / artifact_subdir
+    artifact_dir = (
+        output_root / "comphoser" / artifact_subdir if nest_under_comphoser else output_root / artifact_subdir
+    )
     (artifact_dir / "images" / active_mode).mkdir(parents=True, exist_ok=True)
 
     samples: list[dict[str, Any]] = []
@@ -718,7 +723,9 @@ def _summarize_query_gates(
     effective_values = query_gates.detach().cpu().reshape(query_gates.shape[0], -1)[0]
     thresholded_targets = (target_values >= 0.5).to(dtype=torch.bool)
     thresholded_predictions = (predicted_values >= 0.5).to(dtype=torch.bool)
-    gate_accuracy_pct = float((thresholded_predictions == thresholded_targets).to(dtype=torch.float32).mean().item() * 100.0)
+    gate_accuracy_pct = float(
+        (thresholded_predictions == thresholded_targets).to(dtype=torch.float32).mean().item() * 100.0
+    )
     # Chance baseline + balanced accuracy (R20): with 4 active of 16 slots a do-nothing
     # all-inactive predictor already scores ~75% raw accuracy, so the bare accuracy is
     # uninterpretable on its own. Chance = the all-inactive accuracy; balanced accuracy
@@ -750,15 +757,20 @@ def _summarize_query_gates(
             gate_targets.detach().cpu().reshape(1, -1),
         ).item()
     )
-    family_targets = target_values.reshape(len(PILOT_PRIMITIVE_FAMILY_ORDER), PILOT_QUERIES_PER_PRIMITIVE).mean(dim=1)
-    family_predicted = predicted_values.reshape(len(PILOT_PRIMITIVE_FAMILY_ORDER), PILOT_QUERIES_PER_PRIMITIVE).mean(dim=1)
-    family_active = effective_values.reshape(len(PILOT_PRIMITIVE_FAMILY_ORDER), PILOT_QUERIES_PER_PRIMITIVE).mean(dim=1)
+    n_families = len(PILOT_PRIMITIVE_FAMILY_ORDER)
+    qpf = target_values.shape[-1] // n_families  # queries-per-family (derived from the actual gate count)
+    family_targets = target_values.reshape(n_families, qpf).mean(dim=1)
+    family_predicted = predicted_values.reshape(n_families, qpf).mean(dim=1)
+    family_active = effective_values.reshape(n_families, qpf).mean(dim=1)
     target_binary = target_values > 0.0
     target_gate_mass = float(effective_values[target_binary].sum().item())
     off_target_gate_mass = float(effective_values[~target_binary].sum().item())
     clipped_effective = effective_values.clamp(min=1e-8, max=1.0 - 1e-8)
     gate_entropy = float(
-        (-(clipped_effective * clipped_effective.log()) - ((1.0 - clipped_effective) * (1.0 - clipped_effective).log()))
+        (
+            -(clipped_effective * clipped_effective.log())
+            - ((1.0 - clipped_effective) * (1.0 - clipped_effective).log())
+        )
         .mean()
         .item()
     )
@@ -812,7 +824,11 @@ def _summarize_query_gates(
 def _serialize_explicit_token_masking(explicit_token_masking: Sequence[float] | Tensor | None) -> list[float] | None:
     if explicit_token_masking is None:
         return None
-    tensor = explicit_token_masking.detach().cpu() if isinstance(explicit_token_masking, Tensor) else torch.as_tensor(explicit_token_masking)
+    tensor = (
+        explicit_token_masking.detach().cpu()
+        if isinstance(explicit_token_masking, Tensor)
+        else torch.as_tensor(explicit_token_masking)
+    )
     flattened = tensor.reshape(-1)
     return [float(value) for value in flattened.tolist()]
 
@@ -978,8 +994,7 @@ def _resolve_active_validation_mode(
     if len(pipelines_by_mode) != 1:
         available = ", ".join(sorted(pipelines_by_mode))
         raise ValueError(
-            "Validation mode must be explicit when more than one pipeline is provided. "
-            f"Available modes: {available}"
+            f"Validation mode must be explicit when more than one pipeline is provided. Available modes: {available}"
         )
     return next(iter(pipelines_by_mode))
 

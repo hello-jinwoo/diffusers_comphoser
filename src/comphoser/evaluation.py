@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 import torch
 
@@ -24,6 +24,7 @@ from .training import (
     resolve_pilot_qformer_checkpoint_paths,
     validate_pilot_qformer_checkpoint_metadata,
 )
+
 
 DEFAULT_EVALUATION_MODE = "lora_qformer"
 DEFAULT_EVALUATION_SCOPE = "primitive"
@@ -85,7 +86,9 @@ def evaluate_checkpoint(config: CheckpointEvaluationConfig) -> dict[str, Any]:
     else:
         if checkpoint_dir is not None:
             raise ValueError("checkpoint_dir is not used for flux_only evaluation; omit it")
-        pretrained_model_name_or_path = str(config.pretrained_model_name_or_path or DEFAULT_PRETRAINED_MODEL_NAME_OR_PATH)
+        pretrained_model_name_or_path = str(
+            config.pretrained_model_name_or_path or DEFAULT_PRETRAINED_MODEL_NAME_OR_PATH
+        )
         metadata = {"backbone_id": pretrained_model_name_or_path}
 
     device = resolve_evaluation_device(config.device)
@@ -236,12 +239,29 @@ def load_evaluation_qformer(
     torch_dtype: torch.dtype,
     num_heads: int = 16,
 ) -> ComPhoserQFormer:
+    image_routing = bool(metadata.get("image_routing", False))
+    cond_summary_tokens = metadata.get("cond_summary_tokens")
+    routing_dim = metadata.get("routing_dim")
+    ffn_multiplier = metadata.get("ffn_multiplier")
+    gate_head_hidden = metadata.get("gate_head_hidden")
+    output_content_mix = bool(metadata.get("output_content_mix", False))
+    query_count = int(metadata.get("query_count", DEFAULT_QFORMER_QUERY_COUNT))
+    queries_per_primitive = int(metadata.get("queries_per_primitive", query_count // 4))
     qformer = ComPhoserQFormer(
         hidden_size=int(metadata["query_hidden_size"]),
         cond_token_dim=int(metadata.get("cond_token_dim", metadata["query_hidden_size"])),
-        num_queries=int(metadata.get("query_count", DEFAULT_QFORMER_QUERY_COUNT)),
+        num_queries=query_count,
+        queries_per_primitive=queries_per_primitive,
         num_layers=int(metadata.get("num_layers", DEFAULT_QFORMER_NUM_LAYERS)),
         num_heads=int(num_heads),
+        image_routing=image_routing,
+        output_content_mix=output_content_mix,
+        routing_rounds=int(metadata.get("routing_rounds", 1) or 1),
+        routing_mean_pool=bool(metadata.get("routing_mean_pool", False)),
+        **({} if cond_summary_tokens is None else {"cond_summary_tokens": int(cond_summary_tokens)}),
+        **({} if not routing_dim else {"routing_dim": int(routing_dim)}),
+        **({} if not ffn_multiplier else {"ffn_multiplier": int(ffn_multiplier)}),
+        **({} if not gate_head_hidden else {"gate_head_hidden": int(gate_head_hidden)}),
     )
     load_pilot_qformer_checkpoint(checkpoint_dir, qformer=qformer)
     qformer.requires_grad_(False)

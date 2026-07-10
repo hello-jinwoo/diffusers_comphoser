@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
-
-import numpy as np
 from typing import Any, Callable, Mapping, Sequence
 
+import numpy as np
 import torch
-from PIL import Image, ImageDraw
 from peft import set_peft_model_state_dict
+from PIL import Image, ImageDraw
 
 from diffusers import Flux2KleinPipeline, Flux2Transformer2DModel
 from diffusers.training_utils import free_memory
@@ -18,8 +18,8 @@ from .datasets import MultiPreparedPilotDataset, PreparedPilotDataset, load_prep
 from .inference import (
     DEFAULT_CONTROLLED_VALIDATION_STEPS,
     build_single_validation_case,
-    save_validation_artifacts,
     save_controlled_validation_artifacts,
+    save_validation_artifacts,
 )
 from .qformer import ComPhoserQFormer
 from .training import (
@@ -52,10 +52,17 @@ def build_detached_validation_qformer(
         hidden_size=qformer.hidden_size,
         cond_token_dim=qformer.cond_token_dim,
         num_queries=qformer.num_queries,
+        queries_per_primitive=qformer.queries_per_primitive,
         cond_summary_tokens=qformer.cond_summary_tokens,
         num_layers=qformer.num_layers,
         num_heads=qformer.num_heads,
         ffn_multiplier=qformer.ffn_multiplier,
+        routing_dim=qformer.routing_dim,
+        gate_head_hidden=qformer.gate_head_hidden,
+        output_content_mix=qformer.output_content_mix,
+        routing_rounds=qformer.routing_rounds,
+        routing_mean_pool=qformer.routing_mean_pool,
+        image_routing=qformer.image_routing,
     )
     validation_qformer.load_state_dict(_detach_state_dict_to_cpu(state_dict or qformer.state_dict()))
     validation_qformer.requires_grad_(False)
@@ -71,6 +78,7 @@ def build_detached_validation_pipeline(
     torch_dtype: Any,
     transformer_lora_config: Any,
     transformer_lora_state_dict: Mapping[str, Any],
+    downstream_lora_state_dict: Mapping[str, Any] | None = None,
     include_text_encoder: bool = True,
     enable_model_cpu_offload: bool = False,
     logger: Any | None = None,
@@ -94,6 +102,29 @@ def build_detached_validation_pipeline(
             "Loading detached validation LoRA weights led to unexpected keys not found in the transformer: %s",
             unexpected_keys,
         )
+
+    if downstream_lora_state_dict is not None:
+        # Additive-downstream strategies (step_by_step_stage3 / downstream) train a second LoRA
+        # adapter on top of the frozen "default" one. Load it as a separate adapter and activate
+        # both additively so periodic validation matches the deployed inference path.
+        validation_transformer.add_adapter(transformer_lora_config, adapter_name="downstream")
+        downstream_incompatible_keys = set_peft_model_state_dict(
+            validation_transformer,
+            _detach_state_dict_to_cpu(downstream_lora_state_dict),
+            adapter_name="downstream",
+        )
+        downstream_unexpected_keys = (
+            getattr(downstream_incompatible_keys, "unexpected_keys", None)
+            if downstream_incompatible_keys is not None
+            else None
+        )
+        if downstream_unexpected_keys and logger is not None:
+            logger.warning(
+                "Loading detached downstream validation LoRA weights led to unexpected keys not found "
+                "in the transformer: %s",
+                downstream_unexpected_keys,
+            )
+        validation_transformer.set_adapters(["default", "downstream"], weights=[1.0, 1.0])
 
     validation_transformer.requires_grad_(False)
     validation_transformer.eval()
@@ -128,6 +159,15 @@ def resolve_and_log_pilot_training(args: Any, logger: Any):
         primitive_groups=args.comphoser_primitive_groups,
         qformer_num_queries=args.comphoser_qformer_num_queries,
         qformer_num_layers=args.comphoser_qformer_num_layers,
+        qformer_image_routing=getattr(args, "comphoser_qformer_image_routing", False),
+        qformer_cond_summary_tokens=getattr(args, "comphoser_qformer_cond_summary_tokens", None),
+        qformer_routing_dim=getattr(args, "comphoser_qformer_routing_dim", None),
+        qformer_ffn_multiplier=getattr(args, "comphoser_qformer_ffn_multiplier", None),
+        qformer_gate_head_hidden=getattr(args, "comphoser_qformer_gate_head_hidden", None),
+        qformer_output_content_mix=getattr(args, "comphoser_qformer_output_content_mix", False),
+        qformer_queries_per_primitive=getattr(args, "comphoser_qformer_queries_per_primitive", None),
+        qformer_routing_rounds=getattr(args, "comphoser_qformer_routing_rounds", None),
+        qformer_routing_mean_pool=getattr(args, "comphoser_qformer_routing_mean_pool", False),
         exclude_dataset_ids=getattr(args, "exclude_dataset_ids", None),
         train_dataset_ids=getattr(args, "train_dataset_ids", None),
         include_non_catalog_in_discovery=include_non_catalog,
@@ -138,7 +178,9 @@ def resolve_and_log_pilot_training(args: Any, logger: Any):
                 "Ignoring --dataset_name/--instance_data_dir because ComPhoser pilot modes use the registered prepared dataset root."
             )
         if args.cond_image_column is not None or args.caption_column is not None or args.image_column != "image":
-            logger.info("Ignoring dataset column overrides because ComPhoser pilot modes use prepared manifest metadata.")
+            logger.info(
+                "Ignoring dataset column overrides because ComPhoser pilot modes use prepared manifest metadata."
+            )
         logger.info(
             "Resolved ComPhoser training primitive groups %s to dataset roots %s",
             comphoser_training.training_spec.controls.primitive_groups,
@@ -156,17 +198,37 @@ def build_pilot_qformer(
     if not comphoser_training.uses_qformer:
         return None
 
+    cond_summary_tokens = comphoser_training.qformer_cond_summary_tokens
+    routing_dim = getattr(comphoser_training, "qformer_routing_dim", None)
+    ffn_multiplier = getattr(comphoser_training, "qformer_ffn_multiplier", None)
+    gate_head_hidden = getattr(comphoser_training, "qformer_gate_head_hidden", None)
+    output_content_mix = getattr(comphoser_training, "qformer_output_content_mix", False)
+    qpf = int(getattr(comphoser_training, "qformer_queries_per_primitive", None) or 4)
+    num_queries = 4 * qpf  # 4 fixed families x queries-per-family
+    routing_rounds = int(getattr(comphoser_training, "qformer_routing_rounds", None) or 1)
+    routing_mean_pool = bool(getattr(comphoser_training, "qformer_routing_mean_pool", False))
     qformer = ComPhoserQFormer(
         hidden_size=transformer.config.joint_attention_dim,
         cond_token_dim=transformer.config.in_channels,
-        num_queries=comphoser_training.qformer_num_queries,
+        num_queries=num_queries,
+        queries_per_primitive=qpf,
         num_layers=comphoser_training.qformer_num_layers,
+        image_routing=comphoser_training.qformer_image_routing,
+        output_content_mix=bool(output_content_mix),
+        routing_rounds=routing_rounds,
+        routing_mean_pool=routing_mean_pool,
+        **({} if cond_summary_tokens is None else {"cond_summary_tokens": cond_summary_tokens}),
+        **({} if not routing_dim else {"routing_dim": int(routing_dim)}),
+        **({} if not ffn_multiplier else {"ffn_multiplier": int(ffn_multiplier)}),
+        **({} if not gate_head_hidden else {"gate_head_hidden": int(gate_head_hidden)}),
     )
     logger.info(
-        "Enabled fixed-bank ComPhoser Q-Former mode for primitive groups %s with %s query tokens and %s routing layers",
+        "Enabled fixed-bank ComPhoser Q-Former mode for primitive groups %s with %s query tokens, "
+        "%s routing layers, image_routing=%s",
         comphoser_training.training_spec.controls.primitive_groups,
-        comphoser_training.qformer_num_queries,
+        qformer.num_queries,
         comphoser_training.qformer_num_layers,
+        comphoser_training.qformer_image_routing,
     )
     return qformer
 
@@ -187,11 +249,7 @@ def build_pilot_checkpoint_metadata(
         backbone_id = f"{backbone_id}@{args.revision}"
 
     training_task_ids = tuple(
-        dict.fromkeys(
-            str(task_id)
-            for record in train_dataset.records
-            for task_id in record.task_ids
-        )
+        dict.fromkeys(str(task_id) for record in train_dataset.records for task_id in record.task_ids)
     )
     training_dataset_ids = tuple(
         dict.fromkeys(str(dataset_id) for dataset_id in getattr(train_dataset, "dataset_ids", ()))
@@ -221,6 +279,22 @@ def build_pilot_checkpoint_metadata(
             "training_strategy": getattr(args, "training_strategy", None),
             "sampling_policy": sampling_policy,
             "seed": getattr(args, "seed", None),
+            # Downstream-finetune provenance: which folders the additive LoRA was trained on and
+            # whether they were joint (integrated) or a single per-task run (respective). Only set
+            # for --training_strategy=downstream; left out otherwise so legacy checkpoints are
+            # unaffected.
+            **(
+                {
+                    "downstream_mode": getattr(args, "downstream_mode", None),
+                    "downstream_target_dataset_ids": tuple(
+                        dict.fromkeys(
+                            str(name) for name in (getattr(args, "downstream_target_dataset_ids", None) or ()) if name
+                        )
+                    ),
+                }
+                if getattr(args, "training_strategy", None) == "downstream"
+                else {}
+            ),
         },
     )
 
@@ -304,22 +378,31 @@ def build_unified_qformer_validation_summary(
     }
 
 
-def save_unified_qformer_validation_distribution(
-    validation_results: Sequence[tuple[Path | str, Mapping[str, Any]]] | None,
-    unified_summary: Mapping[str, Any],
-) -> Path | None:
-    distribution = unified_summary.get("query_score_distribution")
-    if not isinstance(distribution, Sequence) or not distribution:
-        return None
-    if not validation_results:
-        return None
+def build_qformer_validation_task_summary(
+    summary_path: Path | str,
+    summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Q-Former gate summary scoped to a single validation task.
 
-    first_summary_path = Path(validation_results[0][0]).expanduser().resolve()
-    if len(first_summary_path.parents) < 2:
-        return None
-    artifact_dir = first_summary_path.parents[1]
-    output_path = artifact_dir / 'qformer_gate_distribution.png'
+    Reuses :func:`build_unified_qformer_validation_summary`'s aggregation (mean predicted
+    gate vector + mean gate accuracy/loss) over one task's samples only, and carries the
+    ``task_id`` so callers can emit task-scoped logging keys instead of collapsing every
+    task into one cross-task average.
+    """
 
+    task_summary = dict(build_unified_qformer_validation_summary(((summary_path, summary),)))
+    task_id = summary.get("task_id")
+    task_summary["task_id"] = str(task_id) if task_id is not None else None
+    return task_summary
+
+
+def _render_qformer_gate_distribution_png(
+    distribution: Sequence[float],
+    output_path: Path,
+    *,
+    distribution_count: int,
+    title: str,
+) -> Path:
     width = 960
     height = 480
     margin_left = 64
@@ -329,7 +412,7 @@ def save_unified_qformer_validation_distribution(
     chart_width = width - margin_left - margin_right
     chart_height = height - margin_top - margin_bottom
 
-    image = Image.new('RGB', (width, height), color=(255, 255, 255))
+    image = Image.new("RGB", (width, height), color=(255, 255, 255))
     draw = ImageDraw.Draw(image)
 
     axis_color = (60, 60, 60)
@@ -342,13 +425,16 @@ def save_unified_qformer_validation_distribution(
         width=2,
     )
 
-    max_value = max(max(float(value) for value in distribution), 1e-6)
-    bar_count = len(distribution)
+    # Sanitize non-finite gate values (NaN/Inf, e.g. from a diverged run) to 0-height bars so a
+    # bad validation pass degrades to an empty chart instead of crashing training on int(NaN).
+    finite_values = [float(value) if math.isfinite(float(value)) else 0.0 for value in distribution]
+    max_value = max(max(finite_values), 1e-6)
+    bar_count = len(finite_values)
     slot_width = chart_width / max(bar_count, 1)
     bar_width = max(int(slot_width * 0.7), 8)
 
-    for index, value in enumerate(distribution):
-        normalized = float(value) / max_value
+    for index, value in enumerate(finite_values):
+        normalized = min(max(value / max_value, 0.0), 1.0)
         bar_height = int(normalized * chart_height)
         x_center = margin_left + int((index + 0.5) * slot_width)
         x0 = x_center - (bar_width // 2)
@@ -359,13 +445,43 @@ def save_unified_qformer_validation_distribution(
         label = str(index + 1)
         draw.text((x_center - 4, y1 + 8), label, fill=text_color)
 
-    draw.text((margin_left, 8), 'Mean Q-Former Gate Score by Query', fill=text_color)
-    draw.text((margin_left + 4, margin_top - 18), f'max={max_value:.3f}', fill=text_color)
-    draw.text((margin_left + chart_width - 180, margin_top - 18), f'n={unified_summary.get("distribution_count", 0)}', fill=text_color)
+    draw.text((margin_left, 8), title, fill=text_color)
+    draw.text((margin_left + 4, margin_top - 18), f"max={max_value:.3f}", fill=text_color)
+    draw.text((margin_left + chart_width - 180, margin_top - 18), f"n={distribution_count}", fill=text_color)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(output_path)
     return output_path
+
+
+def save_qformer_validation_distribution(
+    summary_path: Path | str,
+    task_summary: Mapping[str, Any],
+) -> Path | None:
+    """Render one task's mean Q-Former gate distribution next to its summary artifact.
+
+    Writes ``qformer_gate_distribution.png`` into the task-local validation folder
+    (``Path(summary_path).parent``) so mixed-task runs keep one chart per task instead of a
+    single cross-task average.
+    """
+
+    distribution = task_summary.get("query_score_distribution")
+    if not isinstance(distribution, Sequence) or not distribution:
+        return None
+
+    output_path = Path(summary_path).expanduser().resolve().parent / "qformer_gate_distribution.png"
+
+    task_id = task_summary.get("task_id")
+    title = "Mean Q-Former Gate Score by Query"
+    if task_id:
+        title = f"{title} — {task_id}"
+
+    return _render_qformer_gate_distribution_png(
+        distribution,
+        output_path,
+        distribution_count=int(task_summary.get("distribution_count", 0) or 0),
+        title=title,
+    )
 
 
 def resolve_comphoser_validation_contact_sheet_path(
@@ -432,11 +548,19 @@ def run_comphoser_validation(
                 comphoser_training.training_spec.controls.tasks
             )
             fanout = [
-                (task_spec.dataset_root, task_spec.task_id, task_spec.dataset_id)
-                for task_spec in training_tasks
+                (task_spec.dataset_root, task_spec.task_id, task_spec.dataset_id) for task_spec in training_tasks
             ]
-            downstream_target = getattr(args, "downstream_target_dataset_id", None)
-            if downstream_target and downstream_target not in {entry[2] for entry in fanout}:
+            # Append any downstream targets not already surfaced by training_task_specs. Covers the
+            # single-folder strategies (step_by_step_stage3 / single_dataset via the singular id)
+            # and the unified `downstream` strategy (one or more ids). training_task_specs normally
+            # already includes them (the pool is the downstream folders), so this is a safety net.
+            downstream_targets = list(getattr(args, "downstream_target_dataset_ids", None) or ())
+            singular_target = getattr(args, "downstream_target_dataset_id", None)
+            if singular_target:
+                downstream_targets.append(singular_target)
+            for downstream_target in dict.fromkeys(t for t in downstream_targets if t):
+                if downstream_target in {entry[2] for entry in fanout}:
+                    continue
                 downstream_root = Path("data") / downstream_target
                 if downstream_root.is_dir():
                     fanout.append((downstream_root, downstream_target, downstream_target))
@@ -557,9 +681,7 @@ def run_comphoser_validation(
             seed=args.seed,
             validation_mode=resolved_validation_mode,
             num_outputs_per_sample=args.num_validation_seeds_per_image,
-            num_inference_steps=getattr(
-                args, "num_validation_inference_steps", DEFAULT_CONTROLLED_VALIDATION_STEPS
-            ),
+            num_inference_steps=getattr(args, "num_validation_inference_steps", DEFAULT_CONTROLLED_VALIDATION_STEPS),
             guidance_scale=args.guidance_scale,
             height=args.resolution,
             width=args.resolution,
@@ -671,9 +793,10 @@ __all__ = [
     "build_detached_validation_qformer",
     "build_pilot_checkpoint_metadata",
     "build_pilot_qformer",
+    "build_qformer_validation_task_summary",
     "build_unified_qformer_validation_summary",
     "resolve_and_log_pilot_training",
-    "save_unified_qformer_validation_distribution",
+    "save_qformer_validation_distribution",
     "resolve_comphoser_validation_contact_sheet_path",
     "run_comphoser_validation",
     "run_final_comphoser_export",

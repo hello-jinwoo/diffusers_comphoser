@@ -21,9 +21,26 @@ PRIMITIVE_GROUPS="${PRIMITIVE_GROUPS:-detail tone exposure depth}"
 COMPHOSER_MODE="${COMPHOSER_MODE:-lora_qformer}"
 COMPHOSER_DATA_BACKEND="${COMPHOSER_DATA_BACKEND:-preprocessed}"
 COMPHOSER_QFORMER_NUM_QUERIES="${COMPHOSER_QFORMER_NUM_QUERIES:-16}"
-COMPHOSER_QFORMER_NUM_LAYERS="${COMPHOSER_QFORMER_NUM_LAYERS:-3}"
-COMPHOSER_GATE_LOSS_WEIGHT_INITIAL="${COMPHOSER_GATE_LOSS_WEIGHT_INITIAL:-0.001}"
-COMPHOSER_GATE_LOSS_WEIGHT_FINAL="${COMPHOSER_GATE_LOSS_WEIGHT_FINAL:-0.001}"
+# Controller design defaults = the confirmed small controller (EXP-006): 1 routing layer, a
+# routing_dim=1024 bottleneck, 8 query slots/family (32 tokens), and a 1024-wide gate head.
+# ~34M params (0.13GB) — routes all 4 families and beats the old 8.8GB controller on image quality.
+# Override any of these back to the legacy controller (3 / 0 / 4 / 0) for old checkpoints.
+COMPHOSER_QFORMER_NUM_LAYERS="${COMPHOSER_QFORMER_NUM_LAYERS:-1}"
+# Opt-in condition-image-aware routing (lora_qformer only). 1 feeds the cond-image latent into
+# gate prediction via a learnable attn-pool; 0 (default) keeps the prompt-only v1 controller.
+COMPHOSER_QFORMER_IMAGE_ROUTING="${COMPHOSER_QFORMER_IMAGE_ROUTING:-0}"
+COMPHOSER_QFORMER_COND_SUMMARY_TOKENS="${COMPHOSER_QFORMER_COND_SUMMARY_TOKENS:-4}"
+# Controller-design knobs. routing_dim 0 = no bottleneck (full width). ffn_multiplier default 4.
+COMPHOSER_QFORMER_ROUTING_DIM="${COMPHOSER_QFORMER_ROUTING_DIM:-1024}"
+COMPHOSER_QFORMER_FFN_MULTIPLIER="${COMPHOSER_QFORMER_FFN_MULTIPLIER:-4}"
+COMPHOSER_QFORMER_GATE_HEAD_HIDDEN="${COMPHOSER_QFORMER_GATE_HEAD_HIDDEN:-1024}"
+COMPHOSER_QFORMER_OUTPUT_CONTENT_MIX="${COMPHOSER_QFORMER_OUTPUT_CONTENT_MIX:-0}"
+COMPHOSER_QFORMER_QUERIES_PER_PRIMITIVE="${COMPHOSER_QFORMER_QUERIES_PER_PRIMITIVE:-8}"
+COMPHOSER_QFORMER_ROUTING_ROUNDS="${COMPHOSER_QFORMER_ROUTING_ROUNDS:-1}"
+COMPHOSER_QFORMER_ROUTING_MEAN_POOL="${COMPHOSER_QFORMER_ROUTING_MEAN_POOL:-0}"
+# Recipe defaults for the confirmed controller (EXP-007): gate weight 0.01, lr 1e-4 (see below).
+COMPHOSER_GATE_LOSS_WEIGHT_INITIAL="${COMPHOSER_GATE_LOSS_WEIGHT_INITIAL:-0.01}"
+COMPHOSER_GATE_LOSS_WEIGHT_FINAL="${COMPHOSER_GATE_LOSS_WEIGHT_FINAL:-0.01}"
 COMPHOSER_GATE_LOSS_WEIGHT_SCHEDULER="${COMPHOSER_GATE_LOSS_WEIGHT_SCHEDULER:-linear}"
 
 # Logging / runtime
@@ -42,7 +59,7 @@ OFFLOAD="${OFFLOAD:-0}"
 # Optimizer
 OPTIMIZER="${OPTIMIZER:-AdamW}"
 USE_8BIT_ADAM="${USE_8BIT_ADAM:-0}"
-LEARNING_RATE="${LEARNING_RATE:-2e-4}"
+LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 SCALE_LR="${SCALE_LR:-0}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 LR_NUM_CYCLES="${LR_NUM_CYCLES:-1}"
@@ -114,6 +131,12 @@ build_common_trainer_args() {
     --comphoser_data_backend "${COMPHOSER_DATA_BACKEND}"
     --comphoser_qformer_num_queries "${COMPHOSER_QFORMER_NUM_QUERIES}"
     --comphoser_qformer_num_layers "${COMPHOSER_QFORMER_NUM_LAYERS}"
+    --comphoser_qformer_cond_summary_tokens "${COMPHOSER_QFORMER_COND_SUMMARY_TOKENS}"
+    --comphoser_qformer_routing_dim "${COMPHOSER_QFORMER_ROUTING_DIM}"
+    --comphoser_qformer_ffn_multiplier "${COMPHOSER_QFORMER_FFN_MULTIPLIER}"
+    --comphoser_qformer_gate_head_hidden "${COMPHOSER_QFORMER_GATE_HEAD_HIDDEN}"
+    --comphoser_qformer_queries_per_primitive "${COMPHOSER_QFORMER_QUERIES_PER_PRIMITIVE}"
+    --comphoser_qformer_routing_rounds "${COMPHOSER_QFORMER_ROUTING_ROUNDS}"
     --comphoser_gate_loss_weight_initial "${COMPHOSER_GATE_LOSS_WEIGHT_INITIAL}"
     --comphoser_gate_loss_weight_final "${COMPHOSER_GATE_LOSS_WEIGHT_FINAL}"
     --comphoser_gate_loss_weight_scheduler "${COMPHOSER_GATE_LOSS_WEIGHT_SCHEDULER}"
@@ -158,6 +181,9 @@ build_common_trainer_args() {
   if [[ -n "${CACHE_DIR}" ]]; then COMMON_TRAINER+=(--cache_dir "${CACHE_DIR}"); fi
   if [[ -n "${ASPECT_RATIO_BUCKETS}" ]]; then COMMON_TRAINER+=(--aspect_ratio_buckets "${ASPECT_RATIO_BUCKETS}"); fi
   if [[ -n "${LORA_LAYERS}" ]]; then COMMON_TRAINER+=(--lora_layers "${LORA_LAYERS}"); fi
+  if [[ "${COMPHOSER_QFORMER_IMAGE_ROUTING}" == "1" ]]; then COMMON_TRAINER+=(--comphoser_qformer_image_routing); fi
+  if [[ "${COMPHOSER_QFORMER_OUTPUT_CONTENT_MIX}" == "1" ]]; then COMMON_TRAINER+=(--comphoser_qformer_output_content_mix); fi
+  if [[ "${COMPHOSER_QFORMER_ROUTING_MEAN_POOL}" == "1" ]]; then COMMON_TRAINER+=(--comphoser_qformer_routing_mean_pool); fi
   if [[ "${ENABLE_GRADIENT_CHECKPOINTING}" == "1" ]]; then COMMON_TRAINER+=(--gradient_checkpointing); fi
   if [[ "${ALLOW_TF32}" == "1" ]]; then COMMON_TRAINER+=(--allow_tf32); fi
   if [[ "${USE_8BIT_ADAM}" == "1" ]]; then COMMON_TRAINER+=(--use_8bit_adam); fi
